@@ -478,8 +478,16 @@ func buildWorkflowTask(row *rivertype.JobRow, workflowID string) (*workflowTaskS
 		return b
 	}
 
+	// The frontend's KnownMetadata type (src/services/jobs.ts) reads `task`,
+	// `workflow_id`, `workflow_name`, and `deps` from metadata at the
+	// unprefixed top level — those keys are how the workflow detail route
+	// derives the workflow ID for cancel/retry. River OSS stores the
+	// canonical keys under the `river:` prefix; mirror them here without the
+	// prefix so the existing frontend (shared with riverproui) just works.
+	job := riverJobToSerializableJob(row)
+	job.Metadata = mirroredWorkflowMetadata(row.Metadata, name, deps, workflowID, workflowName)
 	return &workflowTaskSerializable{
-		RiverJob:            riverJobToSerializableJob(row),
+		RiverJob:            job,
 		Deps:                deps,
 		IgnoreCancelledDeps: ignoreBool(metadataKeyWorkflowIgnoreCancelledDeps),
 		IgnoreDeletedDeps:   ignoreBool(metadataKeyWorkflowIgnoreDeletedDeps),
@@ -487,4 +495,32 @@ func buildWorkflowTask(row *rivertype.JobRow, workflowID string) (*workflowTaskS
 		Name:                name,
 		WorkflowID:          workflowID,
 	}, workflowName, nil
+}
+
+// mirroredWorkflowMetadata returns the row's metadata with `task`,
+// `workflow_id`, `workflow_name`, and `deps` aliased at the top level
+// (without the `river:` prefix) so the frontend's KnownMetadata shape
+// resolves correctly. The original `river:*` keys are preserved.
+func mirroredWorkflowMetadata(raw json.RawMessage, taskName string, deps []string, workflowID, workflowName string) json.RawMessage {
+	var meta map[string]json.RawMessage
+	if err := json.Unmarshal(raw, &meta); err != nil || meta == nil {
+		meta = map[string]json.RawMessage{}
+	}
+	put := func(key string, value any) {
+		enc, err := json.Marshal(value)
+		if err == nil {
+			meta[key] = enc
+		}
+	}
+	put("workflow_id", workflowID)
+	put("task", taskName)
+	put("deps", deps)
+	if workflowName != "" {
+		put("workflow_name", workflowName)
+	}
+	out, err := json.Marshal(meta)
+	if err != nil {
+		return raw
+	}
+	return out
 }
