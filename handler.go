@@ -128,6 +128,8 @@ func (e *endpoints[TTx]) MountEndpoints(archetype *baseservice.Archetype, logger
 		apiendpoint.Mount(mux, newStateAndCountGetEndpoint(bundle), mountOpts),
 		apiendpoint.Mount(mux, newWorkflowGetEndpoint(bundle), mountOpts),
 		apiendpoint.Mount(mux, newWorkflowCancelEndpoint(bundle), mountOpts),
+		apiendpoint.Mount(mux, newWorkflowListEndpoint(bundle), mountOpts),
+		apiendpoint.Mount(mux, newWorkflowRetryEndpoint(bundle), mountOpts),
 	}
 }
 
