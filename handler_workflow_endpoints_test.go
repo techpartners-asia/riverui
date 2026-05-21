@@ -263,6 +263,48 @@ func TestAPIWorkflowGetEndpoint_WaitReason(t *testing.T) {
 	require.Equal(t, "none", byName["d"], "cancelled task should not be waiting")
 }
 
+// TestAPIWorkflowListEndpoint_CountFailedDepsDistinguishesCascade pins the
+// distinction between user-initiated cancellations and cascade failures
+// (cancelled tasks whose dep is itself cancelled or discarded). Without it,
+// the workflow list page shows count_failed_deps=0 forever and operators
+// can't tell at a glance which workflows have a real failure to investigate.
+func TestAPIWorkflowListEndpoint_CountFailedDepsDistinguishesCascade(t *testing.T) {
+	t.Parallel()
+	ctx := context.Background()
+	endpoint, bundle := setupEndpoint(ctx, t, newWorkflowListEndpoint)
+
+	// Workflow A: a real cascade — `charge` is discarded, `notify` is cancelled
+	// because its dep `charge` failed.
+	cascadeWF := "wf-cascade"
+	_ = insertWorkflowJobForTest(ctx, t, bundle, cascadeWF, "cascade-test", "ingest", nil, rivertype.JobStateCompleted)
+	_ = insertWorkflowJobForTest(ctx, t, bundle, cascadeWF, "cascade-test", "charge", []string{"ingest"}, rivertype.JobStateDiscarded)
+	_ = insertWorkflowJobForTest(ctx, t, bundle, cascadeWF, "cascade-test", "notify", []string{"charge"}, rivertype.JobStateCancelled)
+
+	// Workflow B: user-cancelled tasks with no failed deps.
+	userWF := "wf-user-cancel"
+	_ = insertWorkflowJobForTest(ctx, t, bundle, userWF, "user-cancel-test", "a", nil, rivertype.JobStateCancelled)
+	_ = insertWorkflowJobForTest(ctx, t, bundle, userWF, "user-cancel-test", "b", nil, rivertype.JobStateCancelled)
+
+	resp, err := endpoint.Execute(ctx, &workflowListRequest{})
+	require.NoError(t, err)
+
+	byID := map[string]*workflowListItem{}
+	for _, w := range resp.Data {
+		byID[w.ID] = w
+	}
+
+	cascade, ok := byID[cascadeWF]
+	require.True(t, ok, "cascade workflow missing from list")
+	require.Equal(t, 1, cascade.CountFailedDeps, "notify task should be cascade-failed via charge")
+	require.Equal(t, 0, cascade.CountCancelled, "cascade-failed tasks must not double-count under cancelled")
+	require.Equal(t, 1, cascade.CountDiscarded, "charge was discarded directly")
+
+	user, ok := byID[userWF]
+	require.True(t, ok, "user-cancel workflow missing from list")
+	require.Equal(t, 0, user.CountFailedDeps, "user-cancelled tasks have no failed deps")
+	require.Equal(t, 2, user.CountCancelled, "both user-cancelled tasks should stay in cancelled bucket")
+}
+
 func TestAPIWorkflowRetryEndpoint(t *testing.T) {
 	t.Parallel()
 	ctx := context.Background()

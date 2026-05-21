@@ -227,18 +227,35 @@ func (req *workflowListRequest) ExtractRaw(r *http.Request) error {
 }
 
 type workflowListItem struct {
-	CountAvailable int       `json:"count_available"`
-	CountCancelled int       `json:"count_cancelled"`
-	CountCompleted int       `json:"count_completed"`
-	CountDiscarded int       `json:"count_discarded"`
-	CountFailedDeps int      `json:"count_failed_deps"`
-	CountPending   int       `json:"count_pending"`
-	CountRetryable int       `json:"count_retryable"`
-	CountRunning   int       `json:"count_running"`
-	CountScheduled int       `json:"count_scheduled"`
-	CreatedAt      time.Time `json:"created_at"`
-	ID             string    `json:"id"`
-	Name           *string   `json:"name"`
+	CountAvailable  int       `json:"count_available"`
+	CountCancelled  int       `json:"count_cancelled"`
+	CountCompleted  int       `json:"count_completed"`
+	CountDiscarded  int       `json:"count_discarded"`
+	CountFailedDeps int       `json:"count_failed_deps"`
+	CountPending    int       `json:"count_pending"`
+	CountRetryable  int       `json:"count_retryable"`
+	CountRunning    int       `json:"count_running"`
+	CountScheduled  int       `json:"count_scheduled"`
+	CreatedAt       time.Time `json:"created_at"`
+	ID              string    `json:"id"`
+	Name            *string   `json:"name"`
+
+	// Internal staging used to compute CountFailedDeps after all rows for a
+	// workflow have been scanned. Tasks are kept here as raw rows so we can
+	// distinguish user-cancelled tasks (no failed dep) from cascade-cancelled
+	// tasks (at least one dep is cancelled or discarded, no ignore flag set).
+	// These fields are not serialized to the client.
+	taskStates    map[string]rivertype.JobState `json:"-"`
+	cancelledRows []cancelledTaskInfo           `json:"-"`
+}
+
+// cancelledTaskInfo carries the metadata needed to reclassify a cancelled
+// task as cascade-failed after the full task set for its workflow has been
+// scanned.
+type cancelledTaskInfo struct {
+	deps                []string
+	ignoreCancelledDeps bool
+	ignoreDiscardedDeps bool
 }
 
 type workflowListResponse struct {
@@ -311,6 +328,8 @@ func (a *workflowListEndpoint[TTx]) Execute(ctx context.Context, req *workflowLi
 		}
 	}
 
+	finalizeCascadeFailures(buckets)
+
 	items := make([]*workflowListItem, 0, len(buckets))
 	for _, v := range buckets {
 		if !workflowStateMatches(v, req.State) {
@@ -345,7 +364,11 @@ func mergeIntoWorkflowList(buckets map[string]*workflowListItem, row *rivertype.
 	}
 	item, ok := buckets[id]
 	if !ok {
-		item = &workflowListItem{ID: id, CreatedAt: row.CreatedAt}
+		item = &workflowListItem{
+			ID:         id,
+			CreatedAt:  row.CreatedAt,
+			taskStates: map[string]rivertype.JobState{},
+		}
 		buckets[id] = item
 	}
 	if row.CreatedAt.Before(item.CreatedAt) {
@@ -360,10 +383,39 @@ func mergeIntoWorkflowList(buckets map[string]*workflowListItem, row *rivertype.
 			item.Name = &name
 		}
 	}
+
+	var taskName string
+	if raw, ok := meta[metadataKeyWorkflowTask]; ok {
+		_ = json.Unmarshal(raw, &taskName)
+	}
+	if taskName != "" {
+		item.taskStates[taskName] = row.State
+	}
+
 	switch row.State {
 	case rivertype.JobStateAvailable:
 		item.CountAvailable++
 	case rivertype.JobStateCancelled:
+		// Stash deps + ignore flags so finalizeCascadeFailures can reclassify
+		// this task as failed-deps once every sibling's state is known.
+		var deps []string
+		if raw, ok := meta[metadataKeyWorkflowDeps]; ok {
+			_ = json.Unmarshal(raw, &deps)
+		}
+		ignoreBool := func(key string) bool {
+			raw, ok := meta[key]
+			if !ok {
+				return false
+			}
+			var b bool
+			_ = json.Unmarshal(raw, &b)
+			return b
+		}
+		item.cancelledRows = append(item.cancelledRows, cancelledTaskInfo{
+			deps:                deps,
+			ignoreCancelledDeps: ignoreBool(metadataKeyWorkflowIgnoreCancelledDeps),
+			ignoreDiscardedDeps: ignoreBool(metadataKeyWorkflowIgnoreDiscardedDeps),
+		})
 		item.CountCancelled++
 	case rivertype.JobStateCompleted:
 		item.CountCompleted++
@@ -379,6 +431,46 @@ func mergeIntoWorkflowList(buckets map[string]*workflowListItem, row *rivertype.
 		item.CountScheduled++
 	}
 	return nil
+}
+
+// finalizeCascadeFailures walks each bucket's cancelled tasks and moves any
+// that were cancelled because of a failed dependency (cancelled or discarded
+// upstream task, ignore flag not set) from CountCancelled into the dedicated
+// CountFailedDeps bucket. This must run after the scan loop completes so the
+// per-task state map is fully populated. Without this, the workflow list page
+// can't distinguish cascade failures from user-initiated cancellations.
+func finalizeCascadeFailures(buckets map[string]*workflowListItem) {
+	for _, item := range buckets {
+		for _, c := range item.cancelledRows {
+			if !cancelledFromFailedDep(c, item.taskStates) {
+				continue
+			}
+			item.CountCancelled--
+			item.CountFailedDeps++
+		}
+		// Free the staging slices/maps before the response is serialized.
+		item.cancelledRows = nil
+		item.taskStates = nil
+	}
+}
+
+// cancelledFromFailedDep returns true if at least one of c.deps is in a
+// failed terminal state (cancelled or discarded) without the corresponding
+// ignore flag being set on c.
+func cancelledFromFailedDep(c cancelledTaskInfo, states map[string]rivertype.JobState) bool {
+	for _, dep := range c.deps {
+		state, known := states[dep]
+		if !known {
+			continue
+		}
+		if state == rivertype.JobStateCancelled && !c.ignoreCancelledDeps {
+			return true
+		}
+		if state == rivertype.JobStateDiscarded && !c.ignoreDiscardedDeps {
+			return true
+		}
+	}
+	return false
 }
 
 func workflowStateMatches(w *workflowListItem, requested string) bool {
