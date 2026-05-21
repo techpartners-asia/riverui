@@ -43,7 +43,20 @@ type workflowTaskSerializable struct {
 	IgnoreDeletedDeps   bool     `json:"ignore_deleted_deps"`
 	IgnoreDiscardedDeps bool     `json:"ignore_discarded_deps"`
 	Name                string   `json:"name"`
+	WaitReason          string   `json:"wait_reason"`
 	WorkflowID          string   `json:"workflow_id"`
+}
+
+// computeWaitReason classifies why a workflow task is currently not running.
+// OSS workflows have no wait-on-signal feature (pro-only), so the only
+// blocking condition is unfinished dependencies: a task sits in `pending`
+// until workflowscheduler promotes it, which happens once every dep reaches
+// a terminal state. Anything not pending is, by definition, not waiting.
+func computeWaitReason(state rivertype.JobState) string {
+	if state == rivertype.JobStatePending {
+		return "dependencies"
+	}
+	return "none"
 }
 
 //
@@ -485,6 +498,7 @@ func buildWorkflowTask(row *rivertype.JobRow, workflowID string) (*workflowTaskS
 		IgnoreDeletedDeps:   ignoreBool(metadataKeyWorkflowIgnoreDeletedDeps),
 		IgnoreDiscardedDeps: ignoreBool(metadataKeyWorkflowIgnoreDiscardedDeps),
 		Name:                name,
+		WaitReason:          computeWaitReason(row.State),
 		WorkflowID:          workflowID,
 	}, workflowName, nil
 }

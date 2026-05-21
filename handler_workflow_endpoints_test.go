@@ -235,6 +235,34 @@ func TestAPIWorkflowGetEndpoint_MetadataContract(t *testing.T) {
 	}
 }
 
+// TestAPIWorkflowGetEndpoint_WaitReason verifies that pending tasks report
+// "dependencies" so the frontend can render "Blocked by dependencies"
+// instead of falling through to "Not waiting" for OSS workflows.
+func TestAPIWorkflowGetEndpoint_WaitReason(t *testing.T) {
+	t.Parallel()
+	ctx := context.Background()
+	endpoint, bundle := setupEndpoint(ctx, t, newWorkflowGetEndpoint)
+
+	workflowID := "wf-wait-reason"
+	_ = insertWorkflowJobForTest(ctx, t, bundle, workflowID, "wait-test", "a", nil, rivertype.JobStateCompleted)
+	_ = insertWorkflowJobForTest(ctx, t, bundle, workflowID, "wait-test", "b", []string{"a"}, rivertype.JobStatePending)
+	_ = insertWorkflowJobForTest(ctx, t, bundle, workflowID, "wait-test", "c", nil, rivertype.JobStateRunning)
+	_ = insertWorkflowJobForTest(ctx, t, bundle, workflowID, "wait-test", "d", nil, rivertype.JobStateCancelled)
+
+	resp, err := endpoint.Execute(ctx, &workflowGetRequest{ID: workflowID})
+	require.NoError(t, err)
+	require.Len(t, resp.Tasks, 4)
+
+	byName := map[string]string{}
+	for _, task := range resp.Tasks {
+		byName[task.Name] = task.WaitReason
+	}
+	require.Equal(t, "none", byName["a"], "completed task should not be waiting")
+	require.Equal(t, "dependencies", byName["b"], "pending task should be blocked by dependencies")
+	require.Equal(t, "none", byName["c"], "running task should not be waiting")
+	require.Equal(t, "none", byName["d"], "cancelled task should not be waiting")
+}
+
 func TestAPIWorkflowRetryEndpoint(t *testing.T) {
 	t.Parallel()
 	ctx := context.Background()
