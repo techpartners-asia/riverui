@@ -65,9 +65,19 @@ func (e *endpoints[TTx]) Configure(bundleOpts *uiendpoints.BundleOpts) {
 
 func (e *endpoints[TTx]) Extensions(ctx context.Context) (map[string]bool, error) {
 	if e.extensions == nil {
-		return map[string]bool{}, nil
+		// The OSS bundle ships with riverworkflow support, so always advertise
+		// the workflow_queries extension. The frontend's workflow routes light
+		// up; absent workflows simply yield empty list responses.
+		return map[string]bool{"workflow_queries": true}, nil
 	}
-	return e.extensions(ctx)
+	exts, err := e.extensions(ctx)
+	if err != nil {
+		return nil, err
+	}
+	if _, set := exts["workflow_queries"]; !set {
+		exts["workflow_queries"] = true
+	}
+	return exts, nil
 }
 
 // SetExtensionsProvider sets the extensions provider function for this bundle.
@@ -116,6 +126,8 @@ func (e *endpoints[TTx]) MountEndpoints(archetype *baseservice.Archetype, logger
 		apiendpoint.Mount(mux, newQueueResumeEndpoint(bundle), mountOpts),
 		apiendpoint.Mount(mux, newQueueUpdateEndpoint(bundle), mountOpts),
 		apiendpoint.Mount(mux, newStateAndCountGetEndpoint(bundle), mountOpts),
+		apiendpoint.Mount(mux, newWorkflowGetEndpoint(bundle), mountOpts),
+		apiendpoint.Mount(mux, newWorkflowCancelEndpoint(bundle), mountOpts),
 	}
 }
 
