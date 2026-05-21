@@ -1,11 +1,14 @@
 package riverui
 
 import (
+	"cmp"
 	"context"
 	"encoding/json"
 	"fmt"
+	"log/slog"
 	"net/http"
 	"slices"
+	"strconv"
 	"time"
 
 	"github.com/riverqueue/apiframe/apiendpoint"
@@ -80,6 +83,7 @@ type workflowGetResponse struct {
 
 func (a *workflowGetEndpoint[TTx]) Execute(ctx context.Context, req *workflowGetRequest) (*workflowGetResponse, error) {
 	rows, err := a.DB.JobGetWorkflowTasks(ctx, &riverdriver.JobGetWorkflowTasksParams{
+		Schema:     a.Client.Schema(),
 		WorkflowID: req.ID,
 	})
 	if err != nil {
@@ -90,7 +94,7 @@ func (a *workflowGetEndpoint[TTx]) Execute(ctx context.Context, req *workflowGet
 	}
 
 	slices.SortFunc(rows, func(a, b *rivertype.JobRow) int {
-		return int(a.ID - b.ID)
+		return cmp.Compare(a.ID, b.ID)
 	})
 
 	tasks := make([]*workflowTaskSerializable, 0, len(rows))
@@ -98,7 +102,10 @@ func (a *workflowGetEndpoint[TTx]) Execute(ctx context.Context, req *workflowGet
 	for _, row := range rows {
 		task, name, err := buildWorkflowTask(row, req.ID)
 		if err != nil {
-			return nil, err
+			a.Logger.WarnContext(ctx, "skipping workflow task with unparseable metadata",
+				slog.Int64("job_id", row.ID),
+				slog.String("error", err.Error()))
+			continue
 		}
 		if workflowName == "" && name != "" {
 			workflowName = name
@@ -143,7 +150,7 @@ func (req *workflowCancelRequest) ExtractRaw(r *http.Request) error {
 }
 
 type workflowCancelResponse struct {
-	CancelledJobs []*RiverJob `json:"cancelled_jobs"`
+	CancelledJobs []*RiverJobMinimal `json:"cancelled_jobs"`
 }
 
 func (a *workflowCancelEndpoint[TTx]) Execute(ctx context.Context, req *workflowCancelRequest) (*workflowCancelResponse, error) {
@@ -153,16 +160,17 @@ func (a *workflowCancelEndpoint[TTx]) Execute(ctx context.Context, req *workflow
 		ControlTopic:      "river_control",
 		Now:               now,
 		Reason:            "cancelled by riverui",
+		Schema:            a.Client.Schema(),
 		WorkflowID:        req.ID,
 	})
 	if err != nil {
 		return nil, fmt.Errorf("error cancelling workflow: %w", err)
 	}
 	slices.SortFunc(rows, func(a, b *rivertype.JobRow) int {
-		return int(a.ID - b.ID)
+		return cmp.Compare(a.ID, b.ID)
 	})
 	return &workflowCancelResponse{
-		CancelledJobs: sliceutil.Map(rows, riverJobToSerializableJob),
+		CancelledJobs: sliceutil.Map(rows, riverJobToSerializableJobMinimal),
 	}, nil
 }
 
@@ -230,37 +238,60 @@ func (a *workflowListEndpoint[TTx]) Execute(ctx context.Context, req *workflowLi
 		limit = *req.Limit
 	}
 
-	// Page through river_job to find rows carrying workflow metadata. This is
-	// a best-effort aggregation; a dedicated driver method is the obvious
-	// next step once the scale of OSS workflow usage warrants it.
+	// Walk river_job by id DESC so the newest (and most likely active) workflow
+	// tasks land in the first batch. State filtering happens post-aggregation
+	// because a workflow's "active" status is derived from its mix of task
+	// states. The hard scan cap keeps memory bounded on huge tables; the loop
+	// also stops early once enough buckets satisfy the filter for the limit.
 	const scanBatch = 1000
-	const maxScan = 10000
+	const maxScan = 50000
 
 	var (
-		afterID    int64 = 0
-		buckets          = map[string]*workflowListItem{}
-		taskCount        = 0
-		exhausted        = false
+		beforeID  int64 = 0
+		first           = true
+		buckets         = map[string]*workflowListItem{}
+		taskCount       = 0
+		exhausted       = false
 	)
 	for taskCount < maxScan && !exhausted {
+		whereClause := `metadata ? 'river:workflow_id'`
+		if !first {
+			whereClause += ` AND id < ` + strconv.FormatInt(beforeID, 10)
+		}
+		first = false
 		rows, err := a.DB.JobList(ctx, &riverdriver.JobListParams{
 			Max:           scanBatch,
-			OrderByClause: `id ASC`,
-			WhereClause:   `metadata ? 'river:workflow_id' AND id > ` + intLit(afterID),
+			OrderByClause: `id DESC`,
+			Schema:        a.Client.Schema(),
+			WhereClause:   whereClause,
 		})
 		if err != nil {
 			return nil, fmt.Errorf("error listing workflow tasks: %w", err)
 		}
 		if len(rows) == 0 {
-			exhausted = true
 			break
 		}
 		for _, row := range rows {
 			taskCount++
-			afterID = row.ID
+			beforeID = row.ID
 			if err := mergeIntoWorkflowList(buckets, row); err != nil {
-				return nil, err
+				a.Logger.WarnContext(ctx, "skipping job with unparseable workflow metadata",
+					slog.Int64("job_id", row.ID),
+					slog.String("error", err.Error()))
+				continue
 			}
+		}
+		// Early-exit heuristic: once we have at least 4x the requested limit
+		// in matching buckets we have a good chance of filling `limit` after
+		// state filtering even if some workflows don't match.
+		matching := 0
+		for _, v := range buckets {
+			if workflowStateMatches(v, req.State) {
+				matching++
+			}
+		}
+		if matching >= limit*4 {
+			break
 		}
 		if len(rows) < scanBatch {
 			exhausted = true
@@ -274,21 +305,12 @@ func (a *workflowListEndpoint[TTx]) Execute(ctx context.Context, req *workflowLi
 		}
 		items = append(items, v)
 	}
-	// Sort by CreatedAt desc, ID asc as tiebreaker.
+	// Sort by CreatedAt desc, then by ID asc as tiebreaker.
 	slices.SortFunc(items, func(a, b *workflowListItem) int {
-		if a.CreatedAt.After(b.CreatedAt) {
-			return -1
+		if c := b.CreatedAt.Compare(a.CreatedAt); c != 0 {
+			return c
 		}
-		if a.CreatedAt.Before(b.CreatedAt) {
-			return 1
-		}
-		if a.ID < b.ID {
-			return -1
-		}
-		if a.ID > b.ID {
-			return 1
-		}
-		return 0
+		return cmp.Compare(a.ID, b.ID)
 	})
 	if len(items) > limit {
 		items = items[:limit]
@@ -365,9 +387,7 @@ func intLit(n int64) string {
 }
 
 //
-// workflowRetryEndpoint — minimal OSS stub that returns 501. Implementing
-// retry semantics for OSS workflows (re-create cancelled/discarded tasks)
-// is a separate design effort.
+// workflowRetryEndpoint
 //
 
 type workflowRetryEndpoint[TTx any] struct {
@@ -387,20 +407,42 @@ func (*workflowRetryEndpoint[TTx]) Meta() *apiendpoint.EndpointMeta {
 }
 
 type workflowRetryRequest struct {
-	ID string `json:"-"`
+	ID           string `json:"-"`
+	Mode         string `json:"mode" validate:"omitempty,oneof=all failed_and_downstream failed_only"`
+	ResetHistory bool   `json:"reset_history"`
 }
 
 func (req *workflowRetryRequest) ExtractRaw(r *http.Request) error {
 	req.ID = r.PathValue("id")
+	if r.ContentLength > 0 && r.Header.Get("Content-Type") == "application/json" {
+		if err := json.NewDecoder(r.Body).Decode(req); err != nil {
+			return apierror.NewBadRequestf("invalid retry body: %s", err)
+		}
+	}
+	if req.Mode == "" {
+		req.Mode = "failed_and_downstream"
+	}
 	return nil
 }
 
 type workflowRetryResponse struct {
-	RetriedJobs []*RiverJob `json:"retried_jobs"`
+	RetriedJobs []*RiverJobMinimal `json:"retried_jobs"`
 }
 
-func (a *workflowRetryEndpoint[TTx]) Execute(_ context.Context, _ *workflowRetryRequest) (*workflowRetryResponse, error) {
-	return nil, apierror.NewBadRequest("Workflow retry is not implemented in the OSS bundle yet.")
+func (a *workflowRetryEndpoint[TTx]) Execute(ctx context.Context, req *workflowRetryRequest) (*workflowRetryResponse, error) {
+	rows, err := a.DB.JobRetryWorkflow(ctx, &riverdriver.JobRetryWorkflowParams{
+		Mode:         req.Mode,
+		Now:          time.Now(),
+		ResetHistory: req.ResetHistory,
+		Schema:       a.Client.Schema(),
+		WorkflowID:   req.ID,
+	})
+	if err != nil {
+		return nil, fmt.Errorf("error retrying workflow: %w", err)
+	}
+	return &workflowRetryResponse{
+		RetriedJobs: sliceutil.Map(rows, riverJobToSerializableJobMinimal),
+	}, nil
 }
 
 // buildWorkflowTask unpacks a JobRow's workflow metadata into the response
