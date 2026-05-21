@@ -6,6 +6,7 @@ import {
   cancelJobs,
   getWorkflow,
   getWorkflowKey,
+  rerunWorkflow,
   retryWorkflow,
   type WorkflowRetryMode,
 } from "@services/workflows";
@@ -120,6 +121,21 @@ function WorkflowComponent() {
     },
   });
 
+  const rerunMutation = useMutation({
+    mutationFn: rerunWorkflow,
+    onSuccess: (result) => {
+      queryClient.invalidateQueries({ queryKey: ["listWorkflows"] });
+      toastSuccess({
+        message: `New workflow ${result.workflowID} created`,
+        duration: 3000,
+      });
+      navigate({
+        to: "/workflows/$workflowId",
+        params: { workflowId: result.workflowID },
+      });
+    },
+  });
+
   return (
     <WorkflowDetail
       cancelPending={cancelMutation.isPending}
@@ -129,11 +145,17 @@ function WorkflowComponent() {
         if (!id) return;
         cancelMutation.mutate({ workflowID: id });
       }}
+      onRerun={() => {
+        const id = requireWorkflowID("rerun workflow");
+        if (!id) return;
+        rerunMutation.mutate({ workflowID: id });
+      }}
       onRetry={(mode: WorkflowRetryMode, resetHistory: boolean) => {
         const id = requireWorkflowID("retry workflow");
         if (!id) return;
         retryMutation.mutate({ workflowID: id, mode, resetHistory });
       }}
+      rerunPending={rerunMutation.isPending}
       retryPending={retryMutation.isPending}
       selectedJobId={selectedJobId}
       setSelectedJobId={setSelectedJobId}

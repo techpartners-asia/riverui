@@ -20,6 +20,7 @@ import { useFeatures } from "@contexts/Features.hook";
 import { CheckIcon } from "@heroicons/react/16/solid";
 import {
   ArrowPathIcon,
+  ArrowPathRoundedSquareIcon,
   ClipboardIcon,
   LinkIcon,
 } from "@heroicons/react/24/outline";
@@ -70,7 +71,9 @@ type WorkflowDetailProps = {
   loadTaskSignals?: TaskSignalLoader;
   loadTaskWaitDiagnostics?: TaskWaitDiagnosticsLoader;
   onCancel?: () => void;
+  onRerun?: () => void;
   onRetry?: (mode: WorkflowRetryMode, resetHistory: boolean) => void;
+  rerunPending?: boolean;
   retryPending?: boolean;
   selectedJobId: bigint | undefined;
   setSelectedJobId: (jobId: bigint | undefined) => void;
@@ -83,7 +86,9 @@ export default function WorkflowDetail({
   loadTaskSignals,
   loadTaskWaitDiagnostics,
   onCancel,
+  onRerun,
   onRetry,
+  rerunPending,
   retryPending,
   selectedJobId,
   setSelectedJobId,
@@ -222,6 +227,15 @@ export default function WorkflowDetail({
               >
                 <XCircleIcon aria-hidden="true" className="mr-2 size-5" />
                 Cancel
+              </ButtonForGroup>
+
+              <ButtonForGroup
+                disabled={rerunPending || !workflowID}
+                onClick={onRerun}
+                title="Rerun this workflow's DAG from scratch under a new workflow ID. Original tasks are left untouched."
+              >
+                <ArrowPathRoundedSquareIcon aria-hidden="true" className="mr-2 size-5" />
+                Rerun
               </ButtonForGroup>
             </span>
           </div>

@@ -420,6 +420,33 @@ export const retryWorkflow: MutationFunction<
   };
 };
 
+type RerunWorkflowPayload = {
+  workflowID: string;
+};
+
+type RerunWorkflowResponse = {
+  insertedJobs: JobMinimal[];
+  workflowID: string;
+};
+
+type RerunWorkflowResponseFromAPI = {
+  inserted_jobs: JobMinimalFromAPI[];
+  workflow_id: string;
+};
+
+export const rerunWorkflow: MutationFunction<
+  RerunWorkflowResponse,
+  RerunWorkflowPayload
+> = async ({ workflowID }) => {
+  const response = await API.post<never, RerunWorkflowResponseFromAPI>(
+    `/pro/workflows/${workflowID}/rerun`,
+  );
+  return {
+    insertedJobs: response.inserted_jobs.map(apiJobMinimalToJobMinimal),
+    workflowID: response.workflow_id,
+  };
+};
+
 type GetWorkflowKey = ["getWorkflow", string];
 
 export const getWorkflowKey = (id: string): GetWorkflowKey => {

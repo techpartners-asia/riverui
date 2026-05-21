@@ -305,6 +305,79 @@ func TestAPIWorkflowListEndpoint_CountFailedDepsDistinguishesCascade(t *testing.
 	require.Equal(t, 2, user.CountCancelled, "both user-cancelled tasks should stay in cancelled bucket")
 }
 
+// TestAPIWorkflowRerunEndpoint verifies that rerunning a workflow creates
+// a fresh set of tasks under a new workflow_id, preserving the original
+// DAG structure (deps), kind, args, queue, and other shape; while the
+// original workflow's rows are untouched.
+func TestAPIWorkflowRerunEndpoint(t *testing.T) {
+	t.Parallel()
+	ctx := context.Background()
+	endpoint, bundle := setupEndpoint(ctx, t, newWorkflowRerunEndpoint)
+
+	origID := "wf-rerun-source"
+	_ = insertWorkflowJobForTest(ctx, t, bundle, origID, "billing", "ingest", nil, rivertype.JobStateCompleted)
+	_ = insertWorkflowJobForTest(ctx, t, bundle, origID, "billing", "charge", []string{"ingest"}, rivertype.JobStateCompleted)
+	_ = insertWorkflowJobForTest(ctx, t, bundle, origID, "billing", "notify", []string{"charge"}, rivertype.JobStateCompleted)
+
+	resp, err := endpoint.Execute(ctx, &workflowRerunRequest{ID: origID})
+	require.NoError(t, err)
+	require.NotEmpty(t, resp.WorkflowID)
+	require.NotEqual(t, origID, resp.WorkflowID, "new workflow must have a different id")
+	require.Len(t, resp.InsertedJobs, 3)
+
+	// Inspect the new workflow's tasks via JobGetWorkflowTasks. They must
+	// have the same kind, args, and deps as the originals — but be fresh
+	// (state available or pending, no errors, attempt=0).
+	newRows, err := bundle.exec.JobGetWorkflowTasks(ctx, &riverdriver.JobGetWorkflowTasksParams{
+		WorkflowID: resp.WorkflowID,
+	})
+	require.NoError(t, err)
+	require.Len(t, newRows, 3, "new workflow should have 3 tasks")
+
+	byName := map[string]*rivertype.JobRow{}
+	for _, r := range newRows {
+		var meta map[string]json.RawMessage
+		require.NoError(t, json.Unmarshal(r.Metadata, &meta))
+		var name string
+		require.NoError(t, json.Unmarshal(meta[metadataKeyWorkflowTask], &name))
+		byName[name] = r
+	}
+
+	ingest := byName["ingest"]
+	require.NotNil(t, ingest)
+	require.Equal(t, "test_workflow", ingest.Kind)
+	require.Equal(t, rivertype.JobStateAvailable, ingest.State, "no-deps task starts available")
+	require.Equal(t, 0, ingest.Attempt)
+
+	charge := byName["charge"]
+	require.NotNil(t, charge)
+	require.Equal(t, rivertype.JobStatePending, charge.State, "deps-task starts pending")
+
+	notify := byName["notify"]
+	require.NotNil(t, notify)
+	require.Equal(t, rivertype.JobStatePending, notify.State)
+
+	// Original tasks must be untouched.
+	origAfter, err := bundle.exec.JobGetWorkflowTasks(ctx, &riverdriver.JobGetWorkflowTasksParams{
+		WorkflowID: origID,
+	})
+	require.NoError(t, err)
+	require.Len(t, origAfter, 3)
+	for _, r := range origAfter {
+		require.Equal(t, rivertype.JobStateCompleted, r.State, "original workflow rows must not be modified")
+	}
+}
+
+func TestAPIWorkflowRerunEndpoint_NotFound(t *testing.T) {
+	t.Parallel()
+	ctx := context.Background()
+	endpoint, _ := setupEndpoint(ctx, t, newWorkflowRerunEndpoint)
+
+	_, err := endpoint.Execute(ctx, &workflowRerunRequest{ID: "nope"})
+	require.Error(t, err)
+	require.Contains(t, err.Error(), "Workflow not found")
+}
+
 func TestAPIWorkflowRetryEndpoint(t *testing.T) {
 	t.Parallel()
 	ctx := context.Background()

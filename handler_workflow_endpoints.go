@@ -3,6 +3,8 @@ package riverui
 import (
 	"cmp"
 	"context"
+	"crypto/rand"
+	"encoding/binary"
 	"encoding/json"
 	"fmt"
 	"log/slog"
@@ -593,4 +595,186 @@ func buildWorkflowTask(row *rivertype.JobRow, workflowID string) (*workflowTaskS
 		WaitReason:          computeWaitReason(row.State),
 		WorkflowID:          workflowID,
 	}, workflowName, nil
+}
+
+//
+// workflowRerunEndpoint
+//
+
+type workflowRerunEndpoint[TTx any] struct {
+	apibundle.APIBundle[TTx]
+	apiendpoint.Endpoint[workflowRerunRequest, workflowRerunResponse]
+}
+
+func newWorkflowRerunEndpoint[TTx any](bundle apibundle.APIBundle[TTx]) *workflowRerunEndpoint[TTx] {
+	return &workflowRerunEndpoint[TTx]{APIBundle: bundle}
+}
+
+func (*workflowRerunEndpoint[TTx]) Meta() *apiendpoint.EndpointMeta {
+	return &apiendpoint.EndpointMeta{
+		Pattern:    "POST /api/pro/workflows/{id}/rerun",
+		StatusCode: http.StatusOK,
+	}
+}
+
+type workflowRerunRequest struct {
+	ID string `json:"-" validate:"required"`
+}
+
+func (req *workflowRerunRequest) ExtractRaw(r *http.Request) error {
+	req.ID = r.PathValue("id")
+	return nil
+}
+
+type workflowRerunResponse struct {
+	WorkflowID  string              `json:"workflow_id"`
+	InsertedJobs []*RiverJobMinimal `json:"inserted_jobs"`
+}
+
+// Execute reads the original workflow's task definitions and inserts a fresh
+// copy under a new workflow ID. The new tasks are inserted in their initial
+// non-terminal state (pending if they have deps, available otherwise);
+// scheduling, retries, and cascade behaviour follow the normal workflow path.
+//
+// The original workflow is not modified; this is a true re-run from scratch,
+// not a retry. Useful for re-running a successfully completed pipeline (e.g.
+// "re-run yesterday's billing for a corrected input file") or starting over
+// after a cancellation.
+func (a *workflowRerunEndpoint[TTx]) Execute(ctx context.Context, req *workflowRerunRequest) (*workflowRerunResponse, error) {
+	origRows, err := a.DB.JobGetWorkflowTasks(ctx, &riverdriver.JobGetWorkflowTasksParams{
+		Schema:     a.Client.Schema(),
+		WorkflowID: req.ID,
+	})
+	if err != nil {
+		return nil, fmt.Errorf("error loading original workflow tasks: %w", err)
+	}
+	if len(origRows) == 0 {
+		return nil, apierror.NewNotFoundf("Workflow not found")
+	}
+
+	newWorkflowID := newWorkflowULID()
+	now := time.Now()
+
+	jobs := make([]*riverdriver.JobInsertFullParams, 0, len(origRows))
+	for _, row := range origRows {
+		params, err := buildRerunInsertParams(row, newWorkflowID, a.Client.Schema(), now)
+		if err != nil {
+			return nil, fmt.Errorf("error building rerun for task id=%d: %w", row.ID, err)
+		}
+		jobs = append(jobs, params)
+	}
+
+	inserted, err := a.DB.JobInsertFullMany(ctx, &riverdriver.JobInsertFullManyParams{
+		Jobs:   jobs,
+		Schema: a.Client.Schema(),
+	})
+	if err != nil {
+		return nil, fmt.Errorf("error inserting rerun workflow tasks: %w", err)
+	}
+
+	a.Logger.InfoContext(ctx, "rerun workflow",
+		slog.String("original_workflow_id", req.ID),
+		slog.String("new_workflow_id", newWorkflowID),
+		slog.Int("tasks", len(inserted)))
+
+	return &workflowRerunResponse{
+		WorkflowID:   newWorkflowID,
+		InsertedJobs: sliceutil.Map(inserted, riverJobToSerializableJobMinimal),
+	}, nil
+}
+
+// buildRerunInsertParams takes an original workflow task row and returns a
+// fresh JobInsertFullParams that, when inserted, becomes a new task in a
+// new workflow with the same args, queue, kind, and dep wiring.
+func buildRerunInsertParams(row *rivertype.JobRow, newWorkflowID, schema string, now time.Time) (*riverdriver.JobInsertFullParams, error) {
+	var origMeta map[string]json.RawMessage
+	if err := json.Unmarshal(row.Metadata, &origMeta); err != nil {
+		return nil, fmt.Errorf("parse metadata: %w", err)
+	}
+
+	// Carry over only the workflow-shape keys; drop anything else (output,
+	// cancel_reason, attempts, etc.) so the new tasks start clean.
+	newMeta := map[string]json.RawMessage{}
+	carry := func(key string) {
+		if v, ok := origMeta[key]; ok {
+			newMeta[key] = v
+		}
+	}
+	carry(metadataKeyWorkflowTask)
+	carry(metadataKeyWorkflowName)
+	carry(metadataKeyWorkflowDeps)
+	carry(metadataKeyWorkflowIgnoreCancelledDeps)
+	carry(metadataKeyWorkflowIgnoreDeletedDeps)
+	carry(metadataKeyWorkflowIgnoreDiscardedDeps)
+
+	wfIDBytes, _ := json.Marshal(newWorkflowID)
+	newMeta[metadataKeyWorkflowID] = wfIDBytes
+
+	metaBytes, err := json.Marshal(newMeta)
+	if err != nil {
+		return nil, fmt.Errorf("marshal metadata: %w", err)
+	}
+
+	// A task with deps starts pending and gets promoted by the scheduler
+	// once its deps reach a terminal state; everything else is immediately
+	// available.
+	state := rivertype.JobStateAvailable
+	if _, hasDeps := newMeta[metadataKeyWorkflowDeps]; hasDeps {
+		state = rivertype.JobStatePending
+	}
+
+	scheduledAt := now
+	return &riverdriver.JobInsertFullParams{
+		EncodedArgs: row.EncodedArgs,
+		Kind:        row.Kind,
+		MaxAttempts: row.MaxAttempts,
+		Metadata:    metaBytes,
+		Priority:    row.Priority,
+		Queue:       row.Queue,
+		ScheduledAt: &scheduledAt,
+		Schema:      schema,
+		State:       state,
+		Tags:        append([]string{}, row.Tags...),
+	}, nil
+}
+
+// newWorkflowULID generates a ULID-shaped 26-character Crockford-base32 ID
+// suitable as a workflow_id. This mirrors river's internal/workflowid
+// generator without taking a dependency on an internal package.
+func newWorkflowULID() string {
+	const crockford = "0123456789ABCDEFGHJKMNPQRSTVWXYZ"
+	var raw [16]byte
+	ms := uint64(time.Now().UnixMilli()) //nolint:gosec
+	binary.BigEndian.PutUint64(raw[0:8], ms<<16)
+	_, _ = rand.Read(raw[6:])
+
+	// Encode 16 bytes (128 bits) into 26 Crockford base32 chars.
+	out := make([]byte, 26)
+	out[0] = crockford[(raw[0]&224)>>5]
+	out[1] = crockford[raw[0]&31]
+	out[2] = crockford[(raw[1]&248)>>3]
+	out[3] = crockford[((raw[1]&7)<<2)|((raw[2]&192)>>6)]
+	out[4] = crockford[(raw[2]&62)>>1]
+	out[5] = crockford[((raw[2]&1)<<4)|((raw[3]&240)>>4)]
+	out[6] = crockford[((raw[3]&15)<<1)|((raw[4]&128)>>7)]
+	out[7] = crockford[(raw[4]&124)>>2]
+	out[8] = crockford[((raw[4]&3)<<3)|((raw[5]&224)>>5)]
+	out[9] = crockford[raw[5]&31]
+	out[10] = crockford[(raw[6]&248)>>3]
+	out[11] = crockford[((raw[6]&7)<<2)|((raw[7]&192)>>6)]
+	out[12] = crockford[(raw[7]&62)>>1]
+	out[13] = crockford[((raw[7]&1)<<4)|((raw[8]&240)>>4)]
+	out[14] = crockford[((raw[8]&15)<<1)|((raw[9]&128)>>7)]
+	out[15] = crockford[(raw[9]&124)>>2]
+	out[16] = crockford[((raw[9]&3)<<3)|((raw[10]&224)>>5)]
+	out[17] = crockford[raw[10]&31]
+	out[18] = crockford[(raw[11]&248)>>3]
+	out[19] = crockford[((raw[11]&7)<<2)|((raw[12]&192)>>6)]
+	out[20] = crockford[(raw[12]&62)>>1]
+	out[21] = crockford[((raw[12]&1)<<4)|((raw[13]&240)>>4)]
+	out[22] = crockford[((raw[13]&15)<<1)|((raw[14]&128)>>7)]
+	out[23] = crockford[(raw[14]&124)>>2]
+	out[24] = crockford[((raw[14]&3)<<3)|((raw[15]&224)>>5)]
+	out[25] = crockford[raw[15]&31]
+	return string(out)
 }
