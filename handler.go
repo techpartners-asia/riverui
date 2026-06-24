@@ -36,11 +36,18 @@ type EndpointsOpts[TTx any] struct {
 }
 
 type endpoints[TTx any] struct {
-	bundleOpts *uiendpoints.BundleOpts
-	client     *river.Client[TTx]
-	extensions func(ctx context.Context) (map[string]bool, error)
-	opts       *EndpointsOpts[TTx]
+	bundleOpts            *uiendpoints.BundleOpts
+	client                *river.Client[TTx]
+	extensions            func(ctx context.Context) (map[string]bool, error)
+	opts                  *EndpointsOpts[TTx]
+	skipWorkflowEndpoints bool
 }
+
+// DisableWorkflowEndpoints implements apibundle.WorkflowEndpointsDisabler. The
+// Pro bundle calls this so the OSS bundle does not register the
+// /api/pro/workflows/... endpoints that Pro provides on the same patterns
+// (duplicate pattern registration panics the mux).
+func (e *endpoints[TTx]) DisableWorkflowEndpoints() { e.skipWorkflowEndpoints = true }
 
 // NewEndpoints creates a new Endpoints bundle, which is a collection of API
 // endpoints for a Handler. Endpoints must be provided to the Handler via the
@@ -111,7 +118,7 @@ func (e *endpoints[TTx]) MountEndpoints(archetype *baseservice.Archetype, logger
 		Logger:                   logger,
 	}
 
-	return []apiendpoint.EndpointInterface{
+	mounted := []apiendpoint.EndpointInterface{
 		apiendpoint.Mount(mux, newAutocompleteListEndpoint(bundle), mountOpts),
 		apiendpoint.Mount(mux, newFeaturesGetEndpoint(bundle), mountOpts),
 		apiendpoint.Mount(mux, newHealthCheckGetEndpoint(bundle), mountOpts),
@@ -126,15 +133,26 @@ func (e *endpoints[TTx]) MountEndpoints(archetype *baseservice.Archetype, logger
 		apiendpoint.Mount(mux, newQueueResumeEndpoint(bundle), mountOpts),
 		apiendpoint.Mount(mux, newQueueUpdateEndpoint(bundle), mountOpts),
 		apiendpoint.Mount(mux, newStateAndCountGetEndpoint(bundle), mountOpts),
-		apiendpoint.Mount(mux, newWorkflowGetEndpoint(bundle), mountOpts),
-		apiendpoint.Mount(mux, newWorkflowCancelEndpoint(bundle), mountOpts),
-		apiendpoint.Mount(mux, newWorkflowListEndpoint(bundle), mountOpts),
-		apiendpoint.Mount(mux, newWorkflowRerunEndpoint(bundle), mountOpts),
-		apiendpoint.Mount(mux, newWorkflowRetryEndpoint(bundle), mountOpts),
-		apiendpoint.Mount(mux, newWorkflowTaskSignalEmitEndpoint(bundle), mountOpts),
-		apiendpoint.Mount(mux, newWorkflowTaskSignalsEndpoint(bundle), mountOpts),
-		apiendpoint.Mount(mux, newWorkflowTaskWaitDiagnosticsEndpoint(bundle), mountOpts),
 	}
+
+	// The Pro bundle provides its own /api/pro/workflows/... endpoints on the
+	// same patterns. When it mounts the OSS bundle it calls
+	// DisableWorkflowEndpoints first so we don't double-register and panic the
+	// mux. OSS standalone registers them as normal.
+	if !e.skipWorkflowEndpoints {
+		mounted = append(mounted,
+			apiendpoint.Mount(mux, newWorkflowGetEndpoint(bundle), mountOpts),
+			apiendpoint.Mount(mux, newWorkflowCancelEndpoint(bundle), mountOpts),
+			apiendpoint.Mount(mux, newWorkflowListEndpoint(bundle), mountOpts),
+			apiendpoint.Mount(mux, newWorkflowRerunEndpoint(bundle), mountOpts),
+			apiendpoint.Mount(mux, newWorkflowRetryEndpoint(bundle), mountOpts),
+			apiendpoint.Mount(mux, newWorkflowTaskSignalEmitEndpoint(bundle), mountOpts),
+			apiendpoint.Mount(mux, newWorkflowTaskSignalsEndpoint(bundle), mountOpts),
+			apiendpoint.Mount(mux, newWorkflowTaskWaitDiagnosticsEndpoint(bundle), mountOpts),
+		)
+	}
+
+	return mounted
 }
 
 // HandlerOpts are the options for creating a new Handler.

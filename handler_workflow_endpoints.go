@@ -44,9 +44,12 @@ const (
 const ossSignalsLimitMax = 100
 
 // workflowTaskSerializable is the response shape consumed by riverui's
-// WorkflowDiagram component. Field names mirror riverproui's wire format so
-// the React frontend renders OSS workflows without modification. Endpoints
-// are mounted under the /api/pro/workflows prefix to match the frontend.
+// WorkflowDiagram component. Field names match riverproui's wire format so the
+// React frontend renders OSS workflows without modification. Note that some
+// numeric IDs are serialized as strings here (vs numbers in Pro); the frontend
+// parsers accept `number | string` (via parseBigInt) and `unknown` sources, so
+// both shapes deserialize. Endpoints are mounted under the /api/pro/workflows
+// prefix to match the frontend.
 type workflowTaskSerializable struct {
 	*RiverJob
 
@@ -751,8 +754,12 @@ func buildWorkflowTask(row *rivertype.JobRow, workflowID string, siblingStates m
 				}
 			}
 
-			// Compute phase from metadata timestamps + job state.
-			phase := "unknown"
+			// Compute phase from metadata timestamps + job state. The default is
+			// "resolved": this block only runs for tasks that carry a wait spec,
+			// and a task that has advanced past 'pending' (running/finalized)
+			// has necessarily cleared its wait gate even if resolved_at was not
+			// recorded. Only pending tasks are still waiting / not started.
+			phase := "resolved"
 			switch {
 			case resolvedAt != nil:
 				phase = "resolved"

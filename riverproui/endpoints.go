@@ -55,6 +55,13 @@ func (e *endpoints[TTx]) Configure(bundleOpts *uiendpoints.BundleOpts) {
 		s.SetExtensionsProvider(e.Extensions)
 	}
 
+	// Stop the OSS bundle from registering the /api/pro/workflows/... endpoints:
+	// this Pro bundle registers its own on the same patterns in MountEndpoints,
+	// and duplicate pattern registration panics the http.ServeMux.
+	if d, ok := e.ossEndpoints.(apibundle.WorkflowEndpointsDisabler); ok {
+		d.DisableWorkflowEndpoints()
+	}
+
 	e.ossEndpoints.Configure(bundleOpts)
 }
 

@@ -25,3 +25,11 @@ type APIBundle[TTx any] struct {
 type APIExtensionsProviderSetter interface {
 	SetExtensionsProvider(provider func(context.Context) (map[string]bool, error))
 }
+
+// WorkflowEndpointsDisabler is a friend interface for riverproui. The Pro
+// bundle registers its own /api/pro/workflows/... endpoints on the same
+// patterns the OSS bundle uses, so it calls this to stop the OSS bundle from
+// registering them — otherwise the http.ServeMux panics on duplicate patterns.
+type WorkflowEndpointsDisabler interface {
+	DisableWorkflowEndpoints()
+}
