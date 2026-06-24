@@ -5,6 +5,12 @@ const FALLBACK_PAYLOAD = '{\n  "approved": true\n}';
 // of the box (e.g. `payload.ok` -> {"ok": true}, `payload.score >= 90` ->
 // {"score": 90}, `payload.action == "go"` -> {"action": "go"}). Falls back to
 // {"approved": true} when no `payload.<field>` reference is found.
+//
+// Best-effort only — the form is editable and the result is a starting point,
+// not a guarantee. Known gaps: strict `>` / `<` produce the boundary value
+// (`payload.score > 90` -> {"score": 90}, which does NOT satisfy `> 90`);
+// reversed operand order (`90 <= payload.score`) and nested fields
+// (`payload.user.name`) are not handled.
 export const defaultPayloadFromCel = (cel?: string): string => {
   if (!cel) return FALLBACK_PAYLOAD;
   const obj: Record<string, unknown> = {};
