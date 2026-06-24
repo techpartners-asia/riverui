@@ -53,18 +53,12 @@ jobs:
       - name: Install dependencies
         run: go mod download
 
-      - name: Install River Pro UI dependencies
-        env:
-          GONOSUMDB: riverqueue.com/riverpro
-          GOPROXY: https://proxy.golang.org,https://u:${{ secrets.RIVERPRO_GO_MOD_CREDENTIAL }}@riverqueue.com/goproxy,direct
-        working-directory: ./riverproui
-        run: go mod download
-
-      - name: Install River Pro CLI
-        env:
-          GONOSUMDB: riverqueue.com/riverpro
-          GOPROXY: https://proxy.golang.org,https://u:${{ secrets.RIVERPRO_GO_MOD_CREDENTIAL }}@riverqueue.com/goproxy,direct
-        run: go install riverqueue.com/riverpro/cmd/riverpro@latest
+      # This fork is OSS-only. The schema (incl. the river_workflow_signal
+      # migration) comes from the river fork this module replaces to ../river,
+      # so the migrate step uses the OSS river CLI built from that checkout
+      # rather than the closed-source riverpro CLI.
+      - name: Install River CLI
+        run: go install github.com/riverqueue/river/cmd/river@latest
 
       - name: Create test DB
         run: createdb river_test
@@ -74,9 +68,7 @@ jobs:
           PGPASSWORD: postgres
 
       - name: Migrate test DB
-        run: |
-          riverpro migrate-up --database-url "$TEST_DATABASE_URL" --line main
-          riverpro migrate-up --database-url "$TEST_DATABASE_URL" --line pro
+        run: river migrate-up --database-url "$TEST_DATABASE_URL"
 
       # ensure that there is a file in `dist` to prevent a lint error about
       # it during CI when there is nothing there:
@@ -91,7 +83,6 @@ jobs:
     runs-on: ubuntu-latest
     env:
       GOLANGCI_LINT_VERSION: v2.11.4
-      GOPROXY: https://proxy.golang.org,https://u:${{ secrets.RIVERPRO_GO_MOD_CREDENTIAL }}@riverqueue.com/goproxy,direct
     permissions:
       contents: read
       # allow read access to pull request. Use with `only-new-issues` option.
