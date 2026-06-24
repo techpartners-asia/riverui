@@ -37,3 +37,4 @@ dist-ssr
 *.sln
 *.sw?
 .wait-ui-*.md
+.approve-backend-report.md

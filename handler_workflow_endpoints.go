@@ -6,6 +6,7 @@ import (
 	"crypto/rand"
 	"encoding/binary"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"log/slog"
 	"net/http"
@@ -1252,4 +1253,107 @@ func mapWaitPhase(p riverworkflow.WaitPhase) string {
 	default:
 		return "unknown"
 	}
+}
+
+//
+// workflowTaskSignalEmitEndpoint
+//
+
+// signalPayloadMismatch is a 409 Conflict API error returned when an
+// idempotency key is reused with a different payload on WorkflowSignalEmit.
+type signalPayloadMismatch struct{ apierror.APIError }
+
+func newSignalPayloadMismatchf(format string, a ...any) *signalPayloadMismatch {
+	return &signalPayloadMismatch{APIError: apierror.APIError{
+		Message:    fmt.Sprintf(format, a...),
+		StatusCode: http.StatusConflict,
+	}}
+}
+
+type workflowTaskSignalEmitEndpoint[TTx any] struct {
+	apibundle.APIBundle[TTx]
+	apiendpoint.Endpoint[workflowTaskSignalEmitRequest, workflowTaskSignalOutput]
+}
+
+func newWorkflowTaskSignalEmitEndpoint[TTx any](bundle apibundle.APIBundle[TTx]) *workflowTaskSignalEmitEndpoint[TTx] {
+	return &workflowTaskSignalEmitEndpoint[TTx]{APIBundle: bundle}
+}
+
+func (*workflowTaskSignalEmitEndpoint[TTx]) Meta() *apiendpoint.EndpointMeta {
+	return &apiendpoint.EndpointMeta{
+		Pattern:    "POST /api/pro/workflows/{id}/task-signals",
+		StatusCode: http.StatusOK,
+	}
+}
+
+type workflowTaskSignalEmitRequest struct {
+	// ID is extracted from the {id} path segment.
+	ID string `json:"-" validate:"required"`
+
+	// Key is the signal key (required).
+	Key string `json:"key" validate:"required"`
+
+	// Payload is the signal payload (required, must be valid JSON).
+	Payload json.RawMessage `json:"payload"`
+
+	// IdempotencyKey is an optional deduplication key.
+	IdempotencyKey string `json:"idempotency_key"`
+
+	// Source is an optional label for the emitting system.
+	Source string `json:"source"`
+
+	// TaskName may be sent by the frontend; accepted and ignored.
+	TaskName string `json:"task_name"`
+}
+
+func (req *workflowTaskSignalEmitRequest) ExtractRaw(r *http.Request) error {
+	req.ID = r.PathValue("id")
+	if r.ContentLength > 0 && r.Header.Get("Content-Type") == "application/json" {
+		if err := json.NewDecoder(r.Body).Decode(req); err != nil {
+			return apierror.NewBadRequestf("invalid signal emit body: %s", err)
+		}
+	}
+	return nil
+}
+
+func (a *workflowTaskSignalEmitEndpoint[TTx]) Execute(ctx context.Context, req *workflowTaskSignalEmitRequest) (*workflowTaskSignalOutput, error) {
+	if len(req.Payload) == 0 {
+		return nil, apierror.NewBadRequestf("payload is required")
+	}
+
+	params := &riverdriver.WorkflowSignalEmitParams{
+		WorkflowID: req.ID,
+		SignalKey:  req.Key,
+		Payload:    []byte(req.Payload),
+		Now:        time.Now(),
+		Schema:     a.Client.Schema(),
+	}
+	if req.IdempotencyKey != "" {
+		params.IdempotencyKey = &req.IdempotencyKey
+	}
+	if req.Source != "" {
+		params.Source = &req.Source
+	}
+
+	sig, err := a.DB.WorkflowSignalEmit(ctx, params)
+	if err != nil {
+		if errors.Is(err, rivertype.ErrWorkflowSignalPayloadMismatch) {
+			return nil, newSignalPayloadMismatchf("signal idempotency key %q already used with a different payload", req.IdempotencyKey)
+		}
+		return nil, fmt.Errorf("error emitting workflow signal: %w", err)
+	}
+
+	payload := json.RawMessage(sig.Payload)
+	if len(payload) == 0 {
+		payload = json.RawMessage(`null`)
+	}
+
+	return &workflowTaskSignalOutput{
+		Attempt:   0,
+		CreatedAt: sig.CreatedAt,
+		ID:        int64String(sig.ID),
+		Key:       sig.SignalKey,
+		Payload:   payload,
+		Source:    sig.Source,
+	}, nil
 }
