@@ -19,6 +19,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - Phase 2 workflow wait-UI endpoints (Phase 2):
   - `GET /api/pro/workflows/{id}/task-signals` lists emitted signals for a workflow task, with `key` filter, `desc` ordering, and `has_more`/`next_cursor_id` pagination fields. Note: server-side cursor filtering is a follow-up (the driver's `WorkflowSignalListParams` has no cursor field).
   - `GET /api/pro/workflows/{id}/task-wait-diagnostics` evaluates the wait expression live via `riverworkflow.WaitDiagnosticsForExec`, returning `phase`, `expr_result`, `truncated`, and per-term `satisfied` state. Static `inputs` (deps/signals/timers) are returned as empty arrays — richer per-input details require follow-up library work.
+  - `POST /api/pro/workflows/{id}/task-signals` emits a signal to a workflow, unblocking signal-gated tasks ("Approve" button backend). Accepts `key` (required), `payload` (required JSON), optional `idempotency_key` and `source`. Returns the emitted signal in `WorkflowTaskSignalFromAPI` shape. Returns 409 Conflict when the same idempotency key is reused with a different payload.
+- Gate inspector "Emit signal" button: each signal-kind wait term in the gate inspector now shows an **Emit signal** button (visible while the wait is pending). Clicking reveals an inline form with the signal key prefilled (read-only) and a JSON payload textarea defaulting to `{ "approved": true }`. Submitting calls `POST /api/pro/workflows/{id}/task-signals`, invalidates the workflow query, and shows a success toast. Invalid JSON is caught client-side and blocks submission. [PR #TBD](https://github.com/riverqueue/riverui/pull/TBD).
 
 ## [v0.16.0] - 2026-05-19
 

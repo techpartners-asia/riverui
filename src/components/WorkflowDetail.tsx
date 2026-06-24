@@ -234,7 +234,10 @@ export default function WorkflowDetail({
                 onClick={onRerun}
                 title="Rerun this workflow's DAG from scratch under a new workflow ID. Original tasks are left untouched."
               >
-                <ArrowPathRoundedSquareIcon aria-hidden="true" className="mr-2 size-5" />
+                <ArrowPathRoundedSquareIcon
+                  aria-hidden="true"
+                  className="mr-2 size-5"
+                />
                 Rerun
               </ButtonForGroup>
             </span>

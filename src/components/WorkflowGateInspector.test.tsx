@@ -1,5 +1,6 @@
 import type { WorkflowTaskWait } from "@services/workflows";
 
+import { QueryClient, QueryClientProvider } from "@tanstack/react-query";
 import {
   act,
   fireEvent,
@@ -8,6 +9,7 @@ import {
   waitFor,
 } from "@testing-library/react";
 import { add } from "date-fns";
+import { type ReactNode } from "react";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 
 import WorkflowGateInspector, {
@@ -726,6 +728,16 @@ describe("WorkflowGateInspector", () => {
   });
 });
 
+const makeQueryWrapper = () => {
+  const queryClient = new QueryClient({
+    defaultOptions: { queries: { retry: false } },
+  });
+  const Wrapper = ({ children }: { children: ReactNode }) => (
+    <QueryClientProvider client={queryClient}>{children}</QueryClientProvider>
+  );
+  return Wrapper;
+};
+
 const renderInspector = (
   wait: WorkflowTaskWait,
   props: {
@@ -757,6 +769,7 @@ const renderInspector = (
       wait={wait}
       workflowID="wf-123"
     />,
+    { wrapper: makeQueryWrapper() },
   );
 };
 

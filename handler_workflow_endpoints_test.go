@@ -772,3 +772,95 @@ func TestAPIWorkflowTaskWaitDiagnosticsEndpoint_NoWait(t *testing.T) {
 	require.Equal(t, "not_started", resp.Phase)
 	require.Len(t, resp.Terms, 0)
 }
+
+//
+// workflowTaskSignalEmitEndpoint tests
+//
+
+func TestAPIWorkflowTaskSignalEmitEndpoint(t *testing.T) {
+	t.Parallel()
+	ctx := context.Background()
+	endpoint, bundle := setupEndpoint(ctx, t, newWorkflowTaskSignalEmitEndpoint)
+
+	workflowID := "wf-emit-signal"
+	// Insert a signal-gated task to represent a realistic workflow.
+	signalSpec := `{"expr":"sig1","terms":[{"name":"sig1","kind":"signal","key":"approved","label":"Approval"}]}`
+	_ = insertWorkflowWaitJobForTest(ctx, t, bundle, workflowID, "emit-test", "step1",
+		nil, rivertype.JobStatePending, signalSpec, "", "")
+
+	resp, err := endpoint.Execute(ctx, &workflowTaskSignalEmitRequest{
+		ID:      workflowID,
+		Key:     "approved",
+		Payload: json.RawMessage(`{"ok":true}`),
+	})
+	require.NoError(t, err)
+	require.Equal(t, "approved", resp.Key)
+	require.NotEqual(t, int64String(0), resp.ID)
+	require.JSONEq(t, `{"ok":true}`, string(resp.Payload))
+	require.Equal(t, 0, resp.Attempt)
+	require.Nil(t, resp.Source)
+
+	// Verify the signal is actually persisted in the DB.
+	signals, err := bundle.exec.WorkflowSignalList(ctx, &riverdriver.WorkflowSignalListParams{
+		WorkflowID:      workflowID,
+		IncludeResolved: true,
+		Max:             10,
+	})
+	require.NoError(t, err)
+	require.Len(t, signals, 1)
+	require.Equal(t, "approved", signals[0].SignalKey)
+	require.JSONEq(t, `{"ok":true}`, string(signals[0].Payload))
+}
+
+func TestAPIWorkflowTaskSignalEmitEndpoint_WithOptionalFields(t *testing.T) {
+	t.Parallel()
+	ctx := context.Background()
+	endpoint, _ := setupEndpoint(ctx, t, newWorkflowTaskSignalEmitEndpoint)
+
+	workflowID := "wf-emit-optional"
+	idemKey := "idem-abc"
+	resp, err := endpoint.Execute(ctx, &workflowTaskSignalEmitRequest{
+		ID:             workflowID,
+		Key:            "approved",
+		Payload:        json.RawMessage(`{"step":1}`),
+		IdempotencyKey: idemKey,
+		Source:         "riverui-test",
+		TaskName:       "step1", // accepted and ignored
+	})
+	require.NoError(t, err)
+	require.Equal(t, "approved", resp.Key)
+	require.NotNil(t, resp.Source)
+	require.Equal(t, "riverui-test", *resp.Source)
+}
+
+func TestAPIWorkflowTaskSignalEmitEndpoint_PayloadMismatch(t *testing.T) {
+	t.Parallel()
+	ctx := context.Background()
+	endpoint, _ := setupEndpoint(ctx, t, newWorkflowTaskSignalEmitEndpoint)
+
+	workflowID := "wf-emit-mismatch"
+	idemKey := "idem-xyz"
+
+	// First emit — succeeds.
+	_, err := endpoint.Execute(ctx, &workflowTaskSignalEmitRequest{
+		ID:             workflowID,
+		Key:            "approved",
+		Payload:        json.RawMessage(`{"v":1}`),
+		IdempotencyKey: idemKey,
+	})
+	require.NoError(t, err)
+
+	// Second emit — same idempotency key, different payload → 409 Conflict.
+	_, err = endpoint.Execute(ctx, &workflowTaskSignalEmitRequest{
+		ID:             workflowID,
+		Key:            "approved",
+		Payload:        json.RawMessage(`{"v":2}`),
+		IdempotencyKey: idemKey,
+	})
+	require.Error(t, err)
+	// The error must be a signalPayloadMismatch so the framework renders it
+	// with the correct HTTP 409 Conflict status rather than collapsing to 500.
+	var apiErr *signalPayloadMismatch
+	require.ErrorAs(t, err, &apiErr, "expected *signalPayloadMismatch from payload mismatch")
+	require.Equal(t, 409, apiErr.StatusCode)
+}

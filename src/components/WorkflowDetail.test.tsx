@@ -3,6 +3,7 @@ import type { Workflow } from "@services/workflows";
 
 import { FeaturesContext } from "@contexts/Features";
 import { JobState } from "@services/types";
+import { QueryClient, QueryClientProvider } from "@tanstack/react-query";
 import {
   createMemoryHistory,
   createRootRoute,
@@ -104,10 +105,18 @@ const renderWorkflowDetail = async (
     routeTree,
   });
 
+  const queryClient = new QueryClient({
+    defaultOptions: { queries: { retry: false } },
+  });
+
   let rendered: ReturnType<typeof render> | undefined;
   await act(async () => {
     await router.load();
-    rendered = render(<RouterProvider router={router} />);
+    rendered = render(
+      <QueryClientProvider client={queryClient}>
+        <RouterProvider router={router} />
+      </QueryClientProvider>,
+    );
   });
 
   return rendered!;
