@@ -140,6 +140,42 @@ describe("WorkflowGateInspector", () => {
     ).toBeInTheDocument();
   });
 
+  it("shows the Emit signal button for an unresolved signal term with a populated signal input", async () => {
+    const wait: WorkflowTaskWait = {
+      exprCel: "approved",
+      inputs: {
+        deps: [{ taskName: "fetch" }],
+        signals: [{ key: "approved" }],
+        timers: [],
+      },
+      phase: "waiting",
+      terms: [
+        {
+          exprCel: "payload.ok",
+          kind: "signal",
+          label: "Manager approval",
+          name: "approved",
+          signalKey: "approved",
+        },
+      ],
+    };
+
+    renderInspector(wait);
+
+    // The Emit signal button lives inside the condition details, which are
+    // collapsed until the user expands them via "Details".
+    expect(
+      screen.queryByRole("button", { name: /emit signal/i }),
+    ).not.toBeInTheDocument();
+
+    await act(async () => {
+      fireEvent.click(screen.getByRole("button", { name: "Details" }));
+    });
+    expect(
+      screen.getByRole("button", { name: /emit signal/i }),
+    ).toBeInTheDocument();
+  });
+
   it("renders dependency and signal CEL terms", async () => {
     const wait: WorkflowTaskWait = {
       exprCel: "classify_intake_done && approval_received",
