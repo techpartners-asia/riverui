@@ -589,3 +589,186 @@ func TestAPIWorkflowGetEndpoint_NoWaitMetadata(t *testing.T) {
 	require.NoError(t, err)
 	require.NotContains(t, string(wireBytes), `"wait":`, "wait must be omitted from JSON when nil")
 }
+
+//
+// workflowTaskSignalsEndpoint tests
+//
+
+func emitSignalForTest(ctx context.Context, t *testing.T, bundle *setupEndpointTestBundle, workflowID, key string, payload []byte) *rivertype.WorkflowSignal {
+	t.Helper()
+	sig, err := bundle.exec.WorkflowSignalEmit(ctx, &riverdriver.WorkflowSignalEmitParams{
+		WorkflowID: workflowID,
+		SignalKey:  key,
+		Payload:    payload,
+		Now:        time.Now().UTC(),
+	})
+	require.NoError(t, err)
+	return sig
+}
+
+func TestAPIWorkflowTaskSignalsEndpoint(t *testing.T) {
+	t.Parallel()
+	ctx := context.Background()
+	endpoint, bundle := setupEndpoint(ctx, t, newWorkflowTaskSignalsEndpoint)
+
+	workflowID := "wf-signals-test"
+
+	// Emit three signals for the same key so we can test ordering and pagination.
+	sig1 := emitSignalForTest(ctx, t, bundle, workflowID, "order.ready", []byte(`{"seq":1}`))
+	sig2 := emitSignalForTest(ctx, t, bundle, workflowID, "order.ready", []byte(`{"seq":2}`))
+	sig3 := emitSignalForTest(ctx, t, bundle, workflowID, "order.ready", []byte(`{"seq":3}`))
+
+	// Fetch all three (desc=true → newest first).
+	resp, err := endpoint.Execute(ctx, &workflowTaskSignalsRequest{
+		ID:       workflowID,
+		TaskName: "step1",
+		Desc:     true,
+		Limit:    20,
+		Scope:    "history",
+	})
+	require.NoError(t, err)
+	require.Len(t, resp.Signals, 3)
+	require.False(t, resp.HasMore)
+	require.Nil(t, resp.NextCursorID)
+	require.Equal(t, "history", resp.Scope)
+
+	// Newest-first order: sig3 > sig2 > sig1.
+	require.Equal(t, int64(sig3.ID), int64(resp.Signals[0].ID))
+	require.Equal(t, int64(sig2.ID), int64(resp.Signals[1].ID))
+	require.Equal(t, int64(sig1.ID), int64(resp.Signals[2].ID))
+
+	// Spot-check one signal's fields.
+	require.Equal(t, "order.ready", resp.Signals[0].Key)
+	require.Equal(t, 0, resp.Signals[0].Attempt)
+	require.JSONEq(t, `{"seq":3}`, string(resp.Signals[0].Payload))
+	require.Nil(t, resp.Signals[0].Source)
+}
+
+func TestAPIWorkflowTaskSignalsEndpoint_Pagination(t *testing.T) {
+	t.Parallel()
+	ctx := context.Background()
+	endpoint, bundle := setupEndpoint(ctx, t, newWorkflowTaskSignalsEndpoint)
+
+	workflowID := "wf-signals-paged"
+	emitSignalForTest(ctx, t, bundle, workflowID, "tick", []byte(`{}`))
+	emitSignalForTest(ctx, t, bundle, workflowID, "tick", []byte(`{}`))
+	emitSignalForTest(ctx, t, bundle, workflowID, "tick", []byte(`{}`))
+
+	// Fetch with limit=2 → has_more=true, next_cursor_id set.
+	resp, err := endpoint.Execute(ctx, &workflowTaskSignalsRequest{
+		ID:       workflowID,
+		TaskName: "any",
+		Desc:     true,
+		Limit:    2,
+		Scope:    "history",
+	})
+	require.NoError(t, err)
+	require.Len(t, resp.Signals, 2)
+	require.True(t, resp.HasMore, "has_more must be true when more rows exist")
+	require.NotNil(t, resp.NextCursorID, "next_cursor_id must be set when has_more=true")
+
+	// Fetch with limit=3 → all returned, no more.
+	resp2, err := endpoint.Execute(ctx, &workflowTaskSignalsRequest{
+		ID:       workflowID,
+		TaskName: "any",
+		Desc:     true,
+		Limit:    3,
+		Scope:    "history",
+	})
+	require.NoError(t, err)
+	require.Len(t, resp2.Signals, 3)
+	require.False(t, resp2.HasMore)
+	require.Nil(t, resp2.NextCursorID)
+}
+
+func TestAPIWorkflowTaskSignalsEndpoint_KeyFilter(t *testing.T) {
+	t.Parallel()
+	ctx := context.Background()
+	endpoint, bundle := setupEndpoint(ctx, t, newWorkflowTaskSignalsEndpoint)
+
+	workflowID := "wf-signals-keyed"
+	emitSignalForTest(ctx, t, bundle, workflowID, "alpha", []byte(`{}`))
+	emitSignalForTest(ctx, t, bundle, workflowID, "beta", []byte(`{}`))
+	emitSignalForTest(ctx, t, bundle, workflowID, "alpha", []byte(`{}`))
+
+	key := "alpha"
+	resp, err := endpoint.Execute(ctx, &workflowTaskSignalsRequest{
+		ID:       workflowID,
+		TaskName: "any",
+		Key:      &key,
+		Desc:     true,
+		Limit:    20,
+		Scope:    "history",
+	})
+	require.NoError(t, err)
+	require.Len(t, resp.Signals, 2, "only alpha signals should be returned")
+	for _, s := range resp.Signals {
+		require.Equal(t, "alpha", s.Key)
+	}
+}
+
+//
+// workflowTaskWaitDiagnosticsEndpoint tests
+//
+
+func TestAPIWorkflowTaskWaitDiagnosticsEndpoint_Pending(t *testing.T) {
+	t.Parallel()
+	ctx := context.Background()
+	endpoint, bundle := setupEndpoint(ctx, t, newWorkflowTaskWaitDiagnosticsEndpoint)
+
+	workflowID := "wf-diag-pending"
+	// Insert a pending task that carries a signal-gated wait spec but no started_at.
+	signalSpec := `{"expr":"sig1","terms":[{"name":"sig1","kind":"signal","key":"order.ready","label":"Order Ready"}]}`
+	_ = insertWorkflowWaitJobForTest(ctx, t, bundle, workflowID, "diag-test", "step1",
+		nil, rivertype.JobStatePending, signalSpec, "", "")
+
+	resp, err := endpoint.Execute(ctx, &workflowTaskWaitDiagnosticsRequest{
+		ID:       workflowID,
+		TaskName: "step1",
+	})
+	require.NoError(t, err)
+
+	// Phase: no signals emitted yet → expr not satisfied → "waiting" (WaitPhasePending).
+	require.Equal(t, "waiting", resp.Phase)
+	require.NotNil(t, resp.ExprResult)
+	require.False(t, *resp.ExprResult)
+
+	// Terms: one term (sig1), not satisfied.
+	require.Len(t, resp.Terms, 1)
+	require.Equal(t, "sig1", resp.Terms[0].Name)
+	require.False(t, resp.Terms[0].Satisfied)
+
+	// Inputs must be non-nil empty slices.
+	require.NotNil(t, resp.Inputs.Deps)
+	require.NotNil(t, resp.Inputs.Signals)
+	require.NotNil(t, resp.Inputs.Timers)
+
+	// inspected_at should be set (close to now).
+	require.WithinDuration(t, time.Now(), resp.InspectedAt, 5*time.Second)
+
+	// signal_scan_limit must be populated.
+	require.Equal(t, waitDiagDefaultScanLimit, resp.SignalScanLimit)
+
+	// Verify JSON shape — inputs arrays must be [] not null.
+	wireBytes, err := json.Marshal(resp)
+	require.NoError(t, err)
+	require.Contains(t, string(wireBytes), `"inputs":{"deps":[],"signals":[],"timers":[]}`)
+}
+
+func TestAPIWorkflowTaskWaitDiagnosticsEndpoint_NoWait(t *testing.T) {
+	t.Parallel()
+	ctx := context.Background()
+	endpoint, bundle := setupEndpoint(ctx, t, newWorkflowTaskWaitDiagnosticsEndpoint)
+
+	workflowID := "wf-diag-nowait"
+	// Task without any wait spec → phase "not_started".
+	_ = insertWorkflowJobForTest(ctx, t, bundle, workflowID, "diag-nowait-test", "plain", nil, rivertype.JobStatePending)
+
+	resp, err := endpoint.Execute(ctx, &workflowTaskWaitDiagnosticsRequest{
+		ID:       workflowID,
+		TaskName: "plain",
+	})
+	require.NoError(t, err)
+	require.Equal(t, "not_started", resp.Phase)
+	require.Len(t, resp.Terms, 0)
+}
