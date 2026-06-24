@@ -39,6 +39,10 @@ const (
 	metadataKeyWorkflowWaitStartedAt       = "river:workflow_wait_started_at"
 )
 
+// ossSignalsLimitMax caps the task-signals page size so a large ?limit cannot
+// force an unbounded driver read. Matches the Pro endpoint's maximum.
+const ossSignalsLimitMax = 100
+
 // workflowTaskSerializable is the response shape consumed by riverui's
 // WorkflowDiagram component. Field names mirror riverproui's wire format so
 // the React frontend renders OSS workflows without modification. Endpoints
@@ -1061,10 +1065,13 @@ func (req *workflowTaskSignalsRequest) ExtractRaw(r *http.Request) error {
 		req.Desc = false
 	}
 
+	// Default 20, capped at ossSignalsLimitMax so a hostile/large ?limit can't
+	// force the driver to load an unbounded number of rows. Mirrors the Pro
+	// endpoint's cap.
 	req.Limit = 20
 	if v := r.URL.Query().Get("limit"); v != "" {
 		if n, err := strconv.Atoi(v); err == nil && n > 0 {
-			req.Limit = n
+			req.Limit = min(n, ossSignalsLimitMax)
 		}
 	}
 
