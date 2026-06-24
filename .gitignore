@@ -38,3 +38,4 @@ dist-ssr
 *.sw?
 .wait-ui-*.md
 .approve-backend-report.md
+.approve-frontend-report.md
