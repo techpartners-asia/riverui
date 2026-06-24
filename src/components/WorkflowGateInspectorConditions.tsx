@@ -280,6 +280,7 @@ const ConditionRow = ({
 
       {signal && wait.phase !== "resolved" ? (
         <EmitSignalButton
+          celExpr={condition.exprCel}
           emit={emitSignal}
           signalKey={signal.key}
           workflowID={workflowID}

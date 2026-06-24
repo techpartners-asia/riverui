@@ -10,10 +10,40 @@ import {
 import { type ReactNode } from "react";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 
+import { defaultPayloadFromCel } from "./emitSignalPayload";
 import {
   EmitSignalButton,
   type EmitSignalFn,
 } from "./WorkflowGateInspectorEmitSignal";
+
+describe("defaultPayloadFromCel", () => {
+  it("derives a payload that satisfies common conditions", () => {
+    expect(JSON.parse(defaultPayloadFromCel("payload.ok"))).toEqual({
+      ok: true,
+    });
+    expect(
+      JSON.parse(defaultPayloadFromCel("payload.approved == true")),
+    ).toEqual({ approved: true });
+    expect(JSON.parse(defaultPayloadFromCel('payload.action == "go"'))).toEqual(
+      { action: "go" },
+    );
+    expect(JSON.parse(defaultPayloadFromCel("payload.score >= 90"))).toEqual({
+      score: 90,
+    });
+    expect(
+      JSON.parse(defaultPayloadFromCel("payload.ok && payload.score >= 5")),
+    ).toEqual({ ok: true, score: 5 });
+  });
+
+  it("falls back to {approved:true} when no payload field is referenced", () => {
+    expect(JSON.parse(defaultPayloadFromCel(undefined))).toEqual({
+      approved: true,
+    });
+    expect(JSON.parse(defaultPayloadFromCel("timers.deadline"))).toEqual({
+      approved: true,
+    });
+  });
+});
 
 describe("EmitSignalButton", () => {
   beforeEach(() => {

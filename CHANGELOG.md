@@ -10,6 +10,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 ### Fixed
 
 - Workflow `GET` now populates `wait.inputs` (signals/timers/deps) from the wait spec's terms and dependencies. Previously these were empty, which prevented the gate inspector from associating a signal term with its input — so the **Emit signal** (approve) button never rendered for signal-gated tasks. [PR #TBD](https://github.com/riverqueue/riverui/pull/TBD).
+- The Emit signal form now prefills a payload derived from the condition's CEL expression (e.g. `payload.ok` → `{"ok": true}`), so emitting a signal satisfies common conditions out of the box instead of defaulting to a payload that may not match. [PR #TBD](https://github.com/riverqueue/riverui/pull/TBD).
 
 ### Added
 

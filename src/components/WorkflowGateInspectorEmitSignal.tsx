@@ -7,11 +7,12 @@ import {
 import { useMutation, useQueryClient } from "@tanstack/react-query";
 import { useState } from "react";
 
-const DEFAULT_PAYLOAD = '{\n  "approved": true\n}';
+import { defaultPayloadFromCel } from "./emitSignalPayload";
 
 export type EmitSignalFn = typeof emitWorkflowTaskSignal;
 
 type EmitSignalFormProps = {
+  celExpr?: string;
   emit?: EmitSignalFn;
   onCancel: () => void;
   onSuccess: (signal: WorkflowTaskSignal) => void;
@@ -20,13 +21,16 @@ type EmitSignalFormProps = {
 };
 
 const EmitSignalForm = ({
+  celExpr,
   emit = emitWorkflowTaskSignal,
   onCancel,
   onSuccess,
   signalKey,
   workflowID,
 }: EmitSignalFormProps) => {
-  const [payloadText, setPayloadText] = useState(DEFAULT_PAYLOAD);
+  const [payloadText, setPayloadText] = useState(() =>
+    defaultPayloadFromCel(celExpr),
+  );
   const [parseError, setParseError] = useState<string>();
 
   const mutation = useMutation<
@@ -136,12 +140,14 @@ const EmitSignalForm = ({
 };
 
 type EmitSignalButtonProps = {
+  celExpr?: string;
   emit?: EmitSignalFn;
   signalKey: string;
   workflowID: string;
 };
 
 export const EmitSignalButton = ({
+  celExpr,
   emit,
   signalKey,
   workflowID,
@@ -158,6 +164,7 @@ export const EmitSignalButton = ({
   if (formOpen) {
     return (
       <EmitSignalForm
+        celExpr={celExpr}
         emit={emit}
         onCancel={() => setFormOpen(false)}
         onSuccess={handleSuccess}
