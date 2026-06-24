@@ -30,26 +30,34 @@ import {
   type WaitFocusRequest,
   type WaitTermView,
 } from "./WorkflowGateInspector.types";
+import {
+  EmitSignalButton,
+  type EmitSignalFn,
+} from "./WorkflowGateInspectorEmitSignal";
 import { ConditionSignalEvidenceDisclosure } from "./WorkflowGateInspectorSignals";
 
 const INLINE_CEL_MAX_LENGTH = 72;
 
 export const WaitTermViews = ({
   conditions,
+  emitSignal,
   focusRequest,
   onLoadMore,
   onToggleConditionSignals,
   openSignalSurface,
   signalListStates,
   wait,
+  workflowID,
 }: {
   conditions: WaitTermView[];
+  emitSignal?: EmitSignalFn;
   focusRequest: undefined | WaitFocusRequest;
   onLoadMore: (surface: SignalHistorySurface) => void;
   onToggleConditionSignals: (surface: SignalHistorySurface) => void;
   openSignalSurface: SignalHistorySurface | undefined;
   signalListStates: Record<string, SignalInspectorState>;
   wait: WorkflowTaskWait;
+  workflowID: string;
 }) => {
   const matchedConditions = conditions.filter((condition) => condition.matched);
   const latestConditionsRef = useRef(conditions);
@@ -116,6 +124,7 @@ export const WaitTermViews = ({
             return (
               <ConditionRow
                 condition={condition}
+                emitSignal={emitSignal}
                 focused={Boolean(
                   focusRequest &&
                   conditionMatchesName(condition, focusRequest.conditionName),
@@ -132,6 +141,7 @@ export const WaitTermViews = ({
                     : emptySignalInspectorState)
                 }
                 wait={wait}
+                workflowID={workflowID}
               />
             );
           })}
@@ -143,6 +153,7 @@ export const WaitTermViews = ({
 
 const ConditionRow = ({
   condition,
+  emitSignal,
   focused,
   onLoadMore,
   onRegisterRow,
@@ -150,8 +161,10 @@ const ConditionRow = ({
   openSignalSurface,
   signalListState,
   wait,
+  workflowID,
 }: {
   condition: WaitTermView;
+  emitSignal?: EmitSignalFn;
   focused: boolean;
   onLoadMore: (surface: SignalHistorySurface) => void;
   onRegisterRow: (condition: WaitTermView, node: HTMLDivElement | null) => void;
@@ -159,6 +172,7 @@ const ConditionRow = ({
   openSignalSurface: SignalHistorySurface | undefined;
   signalListState: SignalInspectorState;
   wait: WorkflowTaskWait;
+  workflowID: string;
 }) => {
   const stateTone = getConditionStateTone(condition, wait.phase);
   const signal = condition.signal;
@@ -261,6 +275,14 @@ const ConditionRow = ({
           signal={signal}
           signalListState={signalListState}
           surface={signalSurfaceForCondition(condition)}
+        />
+      ) : null}
+
+      {signal && wait.phase !== "resolved" ? (
+        <EmitSignalButton
+          emit={emitSignal}
+          signalKey={signal.key}
+          workflowID={workflowID}
         />
       ) : null}
     </div>

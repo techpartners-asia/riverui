@@ -424,6 +424,7 @@ export default function WorkflowWaitInspector({
                 openSignalSurface={currentOpenSignalSurface}
                 signalListStates={conditionSignalStates}
                 wait={wait}
+                workflowID={workflowID}
               />
             </WaitSection>
           ) : null}

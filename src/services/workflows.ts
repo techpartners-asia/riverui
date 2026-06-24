@@ -206,6 +206,15 @@ type CancelResponseFromAPI = {
   cancelled_jobs: JobMinimalFromAPI[];
 };
 
+type EmitWorkflowTaskSignalPayload = {
+  idempotencyKey?: string;
+  key: string;
+  payload: unknown;
+  signal?: AbortSignal;
+  source?: unknown;
+  workflowID: string;
+};
+
 // Represents Job as received from the API. This just like Job, except with
 // string dates instead of Date objects and keys as snake_case instead of
 // camelCase.
@@ -370,6 +379,30 @@ type WorkflowWaitTimerDiagnosticFromAPI = {
   fire_at?: string;
   fired: boolean;
   name: string;
+};
+
+export const emitWorkflowTaskSignal = async ({
+  idempotencyKey,
+  key,
+  payload,
+  signal,
+  source,
+  workflowID,
+}: EmitWorkflowTaskSignalPayload): Promise<WorkflowTaskSignal> => {
+  const bodyObj: Record<string, unknown> = { key, payload };
+  if (idempotencyKey !== undefined) bodyObj.idempotency_key = idempotencyKey;
+  if (source !== undefined) bodyObj.source = source;
+
+  const response = await API.post<string, WorkflowTaskSignalFromAPI>(
+    `/pro/workflows/${workflowID}/task-signals`,
+    JSON.stringify(bodyObj),
+    {
+      headers: { "Content-Type": "application/json" },
+      signal,
+    },
+  );
+
+  return apiWorkflowTaskSignalToWorkflowTaskSignal(response);
 };
 
 export const cancelJobs: MutationFunction<
