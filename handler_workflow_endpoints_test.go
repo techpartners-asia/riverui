@@ -235,32 +235,41 @@ func TestAPIWorkflowGetEndpoint_MetadataContract(t *testing.T) {
 	}
 }
 
-// TestAPIWorkflowGetEndpoint_WaitReason verifies that pending tasks report
-// "dependencies" so the frontend can render "Blocked by dependencies"
-// instead of falling through to "Not waiting" for OSS workflows.
+// TestAPIWorkflowGetEndpoint_WaitReason verifies that pending tasks with an
+// incomplete dep report "dependencies", and that non-pending tasks always
+// report "none". A dep is considered incomplete when its sibling has not yet
+// reached a satisfied terminal state (completed, or cancelled/discarded when
+// the matching ignore flag is set).
 func TestAPIWorkflowGetEndpoint_WaitReason(t *testing.T) {
 	t.Parallel()
 	ctx := context.Background()
 	endpoint, bundle := setupEndpoint(ctx, t, newWorkflowGetEndpoint)
 
 	workflowID := "wf-wait-reason"
-	_ = insertWorkflowJobForTest(ctx, t, bundle, workflowID, "wait-test", "a", nil, rivertype.JobStateCompleted)
+	// "a" is running — still an incomplete dep.
+	_ = insertWorkflowJobForTest(ctx, t, bundle, workflowID, "wait-test", "a", nil, rivertype.JobStateRunning)
+	// "b" is pending waiting on the still-running "a" → "dependencies".
 	_ = insertWorkflowJobForTest(ctx, t, bundle, workflowID, "wait-test", "b", []string{"a"}, rivertype.JobStatePending)
-	_ = insertWorkflowJobForTest(ctx, t, bundle, workflowID, "wait-test", "c", nil, rivertype.JobStateRunning)
-	_ = insertWorkflowJobForTest(ctx, t, bundle, workflowID, "wait-test", "d", nil, rivertype.JobStateCancelled)
+	// "c" is completed — no longer blocking anything.
+	_ = insertWorkflowJobForTest(ctx, t, bundle, workflowID, "wait-test", "c", nil, rivertype.JobStateCompleted)
+	// "d" is pending but its dep "c" is already completed → no incomplete deps → "none".
+	_ = insertWorkflowJobForTest(ctx, t, bundle, workflowID, "wait-test", "d", []string{"c"}, rivertype.JobStatePending)
+	// "e" is cancelled — always "none".
+	_ = insertWorkflowJobForTest(ctx, t, bundle, workflowID, "wait-test", "e", nil, rivertype.JobStateCancelled)
 
 	resp, err := endpoint.Execute(ctx, &workflowGetRequest{ID: workflowID})
 	require.NoError(t, err)
-	require.Len(t, resp.Tasks, 4)
+	require.Len(t, resp.Tasks, 5)
 
 	byName := map[string]string{}
 	for _, task := range resp.Tasks {
 		byName[task.Name] = task.WaitReason
 	}
-	require.Equal(t, "none", byName["a"], "completed task should not be waiting")
-	require.Equal(t, "dependencies", byName["b"], "pending task should be blocked by dependencies")
-	require.Equal(t, "none", byName["c"], "running task should not be waiting")
-	require.Equal(t, "none", byName["d"], "cancelled task should not be waiting")
+	require.Equal(t, "none", byName["a"], "running task should not be waiting")
+	require.Equal(t, "dependencies", byName["b"], "pending task with incomplete dep should be blocked by dependencies")
+	require.Equal(t, "none", byName["c"], "completed task should not be waiting")
+	require.Equal(t, "none", byName["d"], "pending task whose dep is completed has no incomplete deps")
+	require.Equal(t, "none", byName["e"], "cancelled task should not be waiting")
 }
 
 // TestAPIWorkflowListEndpoint_CountFailedDepsDistinguishesCascade pins the
@@ -394,4 +403,189 @@ func TestAPIWorkflowRetryEndpoint(t *testing.T) {
 		require.NotEqual(t, "cancelled", j.State)
 		require.NotEqual(t, "discarded", j.State)
 	}
+}
+
+// insertWorkflowWaitJobForTest inserts a workflow task that carries a
+// river:workflow_wait metadata key. The waitSpec is the raw JSON for the
+// WaitSpec; startedAt and resolvedAt are optional RFC3339 strings (pass ""
+// to omit).
+func insertWorkflowWaitJobForTest(
+	ctx context.Context,
+	t *testing.T,
+	bundle *setupEndpointTestBundle,
+	workflowID, workflowName, taskName string,
+	deps []string,
+	state rivertype.JobState,
+	waitSpecJSON string,
+	startedAt, resolvedAt string,
+) *rivertype.JobRow {
+	t.Helper()
+
+	meta := map[string]any{
+		metadataKeyWorkflowID:   workflowID,
+		metadataKeyWorkflowName: workflowName,
+		metadataKeyWorkflowTask: taskName,
+	}
+	if len(deps) > 0 {
+		meta[metadataKeyWorkflowDeps] = deps
+	}
+	meta[metadataKeyWorkflowWait] = json.RawMessage(waitSpecJSON)
+	if startedAt != "" {
+		meta[metadataKeyWorkflowWaitStartedAt] = startedAt
+	}
+	if resolvedAt != "" {
+		meta[metadataKeyWorkflowWaitResolvedAt] = resolvedAt
+	}
+	metaBytes, err := json.Marshal(meta)
+	require.NoError(t, err)
+
+	var finalizedAt *time.Time
+	if state == rivertype.JobStateCompleted || state == rivertype.JobStateCancelled || state == rivertype.JobStateDiscarded {
+		ft := time.Now()
+		finalizedAt = &ft
+	}
+
+	row, err := bundle.exec.JobInsertFull(ctx, &riverdriver.JobInsertFullParams{
+		EncodedArgs: []byte(`{}`),
+		FinalizedAt: finalizedAt,
+		Kind:        "test_workflow",
+		MaxAttempts: 3,
+		Metadata:    metaBytes,
+		Priority:    1,
+		Queue:       "default",
+		ScheduledAt: ptrutil.Ptr(time.Now()),
+		State:       state,
+		Tags:        []string{},
+	})
+	require.NoError(t, err)
+	return row
+}
+
+// TestAPIWorkflowGetEndpoint_WaitObject asserts that the serialized `wait`
+// object has the correct shape for signal and timer terms, and that
+// wait_reason is computed correctly across the four meaningful scenarios:
+// (1) pending wait-only, (2) pending wait+incomplete dep, (3) resolved wait,
+// (4) non-pending task.
+func TestAPIWorkflowGetEndpoint_WaitObject(t *testing.T) {
+	t.Parallel()
+	ctx := context.Background()
+	endpoint, bundle := setupEndpoint(ctx, t, newWorkflowGetEndpoint)
+
+	workflowID := "wf-wait-obj"
+
+	// Signal-term wait spec.
+	signalSpec := `{"expr":"signal_received","terms":[{"name":"sig1","kind":"signal","key":"my-signal","label":"My Signal"}]}`
+	// Timer-term wait spec.
+	timerSpec := `{"expr":"timer_fired","terms":[{"name":"tim1","kind":"timer","label":"My Timer","timer":{"name":"t1","kind":"absolute"}}]}`
+	// Generic-term wait spec (has cel_expr, no signal_key/timer_name).
+	genericSpec := `{"expr":"custom","terms":[{"name":"gen1","kind":"generic","label":"","cel_expr":"x > 0"}]}`
+
+	startedAt := "2026-06-23T10:00:00Z"
+	resolvedAt := "2026-06-23T11:00:00Z"
+
+	// (1) Pending signal wait, no deps → wait_reason = "wait".
+	_ = insertWorkflowWaitJobForTest(ctx, t, bundle, workflowID, "wait-obj-test", "signal-wait",
+		nil, rivertype.JobStatePending, signalSpec, startedAt, "")
+
+	// (2) Pending wait + a dep on a running task → wait_reason = "dependencies_and_wait".
+	_ = insertWorkflowJobForTest(ctx, t, bundle, workflowID, "wait-obj-test", "runner", nil, rivertype.JobStateRunning)
+	_ = insertWorkflowWaitJobForTest(ctx, t, bundle, workflowID, "wait-obj-test", "wait-and-dep",
+		[]string{"runner"}, rivertype.JobStatePending, timerSpec, "", "")
+
+	// (3) Task whose wait has resolved → wait_reason = "none".
+	_ = insertWorkflowWaitJobForTest(ctx, t, bundle, workflowID, "wait-obj-test", "resolved-wait",
+		nil, rivertype.JobStateCompleted, signalSpec, startedAt, resolvedAt)
+
+	// (4) Generic wait, no label (should fall back to name), cel_expr present.
+	_ = insertWorkflowWaitJobForTest(ctx, t, bundle, workflowID, "wait-obj-test", "generic-wait",
+		nil, rivertype.JobStatePending, genericSpec, "", "")
+
+	resp, err := endpoint.Execute(ctx, &workflowGetRequest{ID: workflowID})
+	require.NoError(t, err)
+	require.Len(t, resp.Tasks, 5)
+
+	byName := map[string]*workflowTaskSerializable{}
+	for _, task := range resp.Tasks {
+		byName[task.Name] = task
+	}
+
+	// --- (1) signal-wait ---
+	sw := byName["signal-wait"]
+	require.NotNil(t, sw, "signal-wait task must be present")
+	require.NotNil(t, sw.Wait, "signal-wait must have a wait object")
+	require.Equal(t, "signal_received", sw.Wait.ExprCEL)
+	require.Equal(t, "waiting", sw.Wait.Phase, "started_at present + pending → 'waiting'")
+	require.Equal(t, &startedAt, sw.Wait.StartedAt)
+	require.Nil(t, sw.Wait.ResolvedAt)
+	require.Len(t, sw.Wait.Terms, 1)
+	require.Equal(t, "sig1", sw.Wait.Terms[0].Name)
+	require.Equal(t, "signal", sw.Wait.Terms[0].Kind)
+	require.Equal(t, "My Signal", sw.Wait.Terms[0].Label)
+	require.NotNil(t, sw.Wait.Terms[0].SignalKey)
+	require.Equal(t, "my-signal", *sw.Wait.Terms[0].SignalKey)
+	require.Nil(t, sw.Wait.Terms[0].TimerName)
+	// inputs must be non-nil empty arrays.
+	require.NotNil(t, sw.Wait.Inputs.Deps)
+	require.NotNil(t, sw.Wait.Inputs.Signals)
+	require.NotNil(t, sw.Wait.Inputs.Timers)
+	require.Equal(t, "wait", sw.WaitReason)
+
+	// --- (2) wait-and-dep ---
+	wd := byName["wait-and-dep"]
+	require.NotNil(t, wd, "wait-and-dep task must be present")
+	require.NotNil(t, wd.Wait, "wait-and-dep must have a wait object")
+	require.Equal(t, "timer_fired", wd.Wait.ExprCEL)
+	require.Equal(t, "not_started", wd.Wait.Phase, "no started_at → 'not_started'")
+	require.Len(t, wd.Wait.Terms, 1)
+	require.Equal(t, "timer", wd.Wait.Terms[0].Kind)
+	require.NotNil(t, wd.Wait.Terms[0].TimerName)
+	require.Equal(t, "t1", *wd.Wait.Terms[0].TimerName)
+	require.Nil(t, wd.Wait.Terms[0].SignalKey)
+	require.Equal(t, "dependencies_and_wait", wd.WaitReason)
+
+	// --- (3) resolved-wait ---
+	rw := byName["resolved-wait"]
+	require.NotNil(t, rw, "resolved-wait task must be present")
+	require.NotNil(t, rw.Wait, "resolved-wait must have a wait object")
+	require.Equal(t, "resolved", rw.Wait.Phase)
+	require.Equal(t, &resolvedAt, rw.Wait.ResolvedAt)
+	require.Equal(t, "none", rw.WaitReason, "resolved wait → not blocking")
+
+	// --- (4) generic-wait label fallback ---
+	gw := byName["generic-wait"]
+	require.NotNil(t, gw, "generic-wait task must be present")
+	require.NotNil(t, gw.Wait)
+	require.Len(t, gw.Wait.Terms, 1)
+	require.Equal(t, "gen1", gw.Wait.Terms[0].Label, "empty label should fall back to name")
+	require.NotNil(t, gw.Wait.Terms[0].ExprCEL, "cel_expr should be present")
+	require.Equal(t, "x > 0", *gw.Wait.Terms[0].ExprCEL)
+	require.Nil(t, gw.Wait.Terms[0].SignalKey, "generic term has no signal_key")
+	require.Nil(t, gw.Wait.Terms[0].TimerName, "generic term has no timer_name")
+	require.Equal(t, "wait", gw.WaitReason)
+
+	// Verify the wait JSON round-trips through JSON correctly (arrays not null).
+	wireBytes, err := json.Marshal(resp)
+	require.NoError(t, err)
+	require.Contains(t, string(wireBytes), `"inputs":{"deps":[],"signals":[],"timers":[]}`)
+	require.Contains(t, string(wireBytes), `"terms":[`)
+}
+
+// TestAPIWorkflowGetEndpoint_NoWaitMetadata verifies that tasks without
+// river:workflow_wait metadata emit no "wait" field (omitempty).
+func TestAPIWorkflowGetEndpoint_NoWaitMetadata(t *testing.T) {
+	t.Parallel()
+	ctx := context.Background()
+	endpoint, bundle := setupEndpoint(ctx, t, newWorkflowGetEndpoint)
+
+	workflowID := "wf-no-wait"
+	_ = insertWorkflowJobForTest(ctx, t, bundle, workflowID, "no-wait-test", "plain", nil, rivertype.JobStateCompleted)
+
+	resp, err := endpoint.Execute(ctx, &workflowGetRequest{ID: workflowID})
+	require.NoError(t, err)
+	require.Len(t, resp.Tasks, 1)
+	require.Nil(t, resp.Tasks[0].Wait, "task without wait metadata must have nil Wait")
+
+	wireBytes, err := json.Marshal(resp)
+	require.NoError(t, err)
+	require.NotContains(t, string(wireBytes), `"wait":`, "wait must be omitted from JSON when nil")
 }

@@ -31,6 +31,10 @@ const (
 	metadataKeyWorkflowIgnoreDiscardedDeps = "river:workflow_ignore_discarded_deps"
 	metadataKeyWorkflowName                = "river:workflow_name"
 	metadataKeyWorkflowTask                = "river:workflow_task"
+	metadataKeyWorkflowWait                = "river:workflow_wait"
+	metadataKeyWorkflowWaitFailedReason    = "river:workflow_wait_failed_reason"
+	metadataKeyWorkflowWaitResolvedAt      = "river:workflow_wait_resolved_at"
+	metadataKeyWorkflowWaitStartedAt       = "river:workflow_wait_started_at"
 )
 
 // workflowTaskSerializable is the response shape consumed by riverui's
@@ -40,25 +44,106 @@ const (
 type workflowTaskSerializable struct {
 	*RiverJob
 
-	Deps                []string `json:"deps"`
-	IgnoreCancelledDeps bool     `json:"ignore_cancelled_deps"`
-	IgnoreDeletedDeps   bool     `json:"ignore_deleted_deps"`
-	IgnoreDiscardedDeps bool     `json:"ignore_discarded_deps"`
-	Name                string   `json:"name"`
-	WaitReason          string   `json:"wait_reason"`
-	WorkflowID          string   `json:"workflow_id"`
+	Deps                []string                `json:"deps"`
+	IgnoreCancelledDeps bool                    `json:"ignore_cancelled_deps"`
+	IgnoreDeletedDeps   bool                    `json:"ignore_deleted_deps"`
+	IgnoreDiscardedDeps bool                    `json:"ignore_discarded_deps"`
+	Name                string                  `json:"name"`
+	Wait                *workflowTaskWaitOutput `json:"wait,omitempty"`
+	WaitReason          string                  `json:"wait_reason"`
+	WorkflowID          string                  `json:"workflow_id"`
 }
 
-// computeWaitReason classifies why a workflow task is currently not running.
-// OSS workflows have no wait-on-signal feature (pro-only), so the only
-// blocking condition is unfinished dependencies: a task sits in `pending`
-// until workflowscheduler promotes it, which happens once every dep reaches
-// a terminal state. Anything not pending is, by definition, not waiting.
-func computeWaitReason(state rivertype.JobState) string {
-	if state == rivertype.JobStatePending {
-		return "dependencies"
+// workflowTaskWaitOutput is the per-task wait spec emitted to the frontend.
+// Field names match the WorkflowTaskWaitFromAPI TypeScript type exactly.
+type workflowTaskWaitOutput struct {
+	ExprCEL    string                       `json:"expr_cel"`
+	Phase      string                       `json:"phase"`
+	Terms      []workflowTaskWaitTermOutput `json:"terms"`
+	Inputs     workflowTaskWaitInputsOutput `json:"inputs"`
+	ResolvedAt *string                      `json:"resolved_at,omitempty"`
+	StartedAt  *string                      `json:"started_at,omitempty"`
+	Summary    *string                      `json:"summary,omitempty"`
+}
+
+// workflowTaskWaitTermOutput is one entry in the wait spec's terms array.
+type workflowTaskWaitTermOutput struct {
+	Name      string  `json:"name"`
+	Kind      string  `json:"kind"`
+	Label     string  `json:"label"`
+	ExprCEL   *string `json:"expr_cel,omitempty"`
+	SignalKey *string `json:"signal_key,omitempty"`
+	TimerName *string `json:"timer_name,omitempty"`
+}
+
+// workflowTaskWaitInputsOutput holds the Phase 1 static inputs (always empty arrays).
+type workflowTaskWaitInputsOutput struct {
+	Deps    []struct{} `json:"deps"`
+	Signals []struct{} `json:"signals"`
+	Timers  []struct{} `json:"timers"`
+}
+
+// waitSpecJSON mirrors the JSON shape of a WaitSpec stored in river:workflow_wait.
+// Tags verified against riverworkflow/internal/workflowscheduler/wait_eval.go.
+type waitSpecJSON struct {
+	Terms []waitTermSpecJSON `json:"terms"`
+	Expr  string             `json:"expr"`
+}
+
+type waitTermSpecJSON struct {
+	Name    string         `json:"name"`
+	Kind    string         `json:"kind"`
+	Key     string         `json:"key,omitempty"`
+	CELExpr string         `json:"cel_expr,omitempty"`
+	Timer   *timerSpecJSON `json:"timer,omitempty"`
+	Label   string         `json:"label,omitempty"`
+}
+
+type timerSpecJSON struct {
+	Name string `json:"name"`
+}
+
+// computeWaitReason classifies why a workflow task is currently blocked.
+// Returns one of: "dependencies_and_wait", "dependencies", "wait", "none".
+// For non-pending tasks this is always "none". For pending tasks we combine
+// two flags: (1) hasWait — the task carries a river:workflow_wait key whose
+// phase is not yet "resolved"; (2) hasIncompleteDeps — at least one declared
+// dep whose sibling has not yet reached a satisfied terminal state.
+func computeWaitReason(state rivertype.JobState, hasWait, hasIncompleteDeps bool) string {
+	if state != rivertype.JobStatePending {
+		return "none"
 	}
-	return "none"
+	switch {
+	case hasWait && hasIncompleteDeps:
+		return "dependencies_and_wait"
+	case hasWait:
+		return "wait"
+	case hasIncompleteDeps:
+		return "dependencies"
+	default:
+		return "none"
+	}
+}
+
+// depIsSatisfied returns true when a dep's state is a "satisfied" terminal for
+// the given ignore flags. A dep with no known state is treated as incomplete
+// (missing) unless ignoreDeleted is set.
+func depIsSatisfied(depName string, siblingStates map[string]rivertype.JobState, ignoreCancelled, ignoreDiscarded, ignoreDeleted bool) bool {
+	state, known := siblingStates[depName]
+	if !known {
+		return ignoreDeleted
+	}
+	switch state {
+	case rivertype.JobStateCompleted:
+		return true
+	case rivertype.JobStateCancelled:
+		return ignoreCancelled
+	case rivertype.JobStateDiscarded:
+		return ignoreDiscarded
+	default:
+		// available, pending, running, retryable, scheduled → not yet done
+		return false
+	}
 }
 
 //
@@ -112,10 +197,27 @@ func (a *workflowGetEndpoint[TTx]) Execute(ctx context.Context, req *workflowGet
 		return cmp.Compare(a.ID, b.ID)
 	})
 
+	// Build a task-name → state map so buildWorkflowTask can accurately
+	// determine whether a task's declared deps are all satisfied.
+	siblingStates := make(map[string]rivertype.JobState, len(rows))
+	for _, row := range rows {
+		var meta map[string]json.RawMessage
+		if err := json.Unmarshal(row.Metadata, &meta); err != nil {
+			continue
+		}
+		var taskName string
+		if raw, ok := meta[metadataKeyWorkflowTask]; ok {
+			_ = json.Unmarshal(raw, &taskName)
+		}
+		if taskName != "" {
+			siblingStates[taskName] = row.State
+		}
+	}
+
 	tasks := make([]*workflowTaskSerializable, 0, len(rows))
 	var workflowName string
 	for _, row := range rows {
-		task, name, err := buildWorkflowTask(row, req.ID)
+		task, name, err := buildWorkflowTask(row, req.ID, siblingStates)
 		if err != nil {
 			a.Logger.WarnContext(ctx, "skipping workflow task with unparseable metadata",
 				slog.Int64("job_id", row.ID),
@@ -553,8 +655,9 @@ func (a *workflowRetryEndpoint[TTx]) Execute(ctx context.Context, req *workflowR
 }
 
 // buildWorkflowTask unpacks a JobRow's workflow metadata into the response
-// task shape.
-func buildWorkflowTask(row *rivertype.JobRow, workflowID string) (*workflowTaskSerializable, string, error) {
+// task shape. siblingStates maps task-name → state for every task in the
+// workflow and is used to determine whether a task's deps are all satisfied.
+func buildWorkflowTask(row *rivertype.JobRow, workflowID string, siblingStates map[string]rivertype.JobState) (*workflowTaskSerializable, string, error) {
 	var meta map[string]json.RawMessage
 	if err := json.Unmarshal(row.Metadata, &meta); err != nil {
 		return nil, "", fmt.Errorf("parse metadata for job %d: %w", row.ID, err)
@@ -585,14 +688,106 @@ func buildWorkflowTask(row *rivertype.JobRow, workflowID string) (*workflowTaskS
 		return b
 	}
 
+	ignoreCancelled := ignoreBool(metadataKeyWorkflowIgnoreCancelledDeps)
+	ignoreDeleted := ignoreBool(metadataKeyWorkflowIgnoreDeletedDeps)
+	ignoreDiscarded := ignoreBool(metadataKeyWorkflowIgnoreDiscardedDeps)
+
+	// Determine whether any declared dep is not yet in a satisfied terminal state.
+	hasIncompleteDeps := false
+	for _, dep := range deps {
+		if !depIsSatisfied(dep, siblingStates, ignoreCancelled, ignoreDiscarded, ignoreDeleted) {
+			hasIncompleteDeps = true
+			break
+		}
+	}
+
+	// Parse the wait spec from river:workflow_wait if present.
+	var waitOutput *workflowTaskWaitOutput
+	if rawWait, ok := meta[metadataKeyWorkflowWait]; ok {
+		var spec waitSpecJSON
+		if err := json.Unmarshal(rawWait, &spec); err == nil {
+			// Parse optional RFC3339 timestamp fields.
+			parseTimestamp := func(key string) *string {
+				raw, ok := meta[key]
+				if !ok {
+					return nil
+				}
+				var s string
+				if err := json.Unmarshal(raw, &s); err != nil || s == "" {
+					return nil
+				}
+				return &s
+			}
+
+			resolvedAt := parseTimestamp(metadataKeyWorkflowWaitResolvedAt)
+			startedAt := parseTimestamp(metadataKeyWorkflowWaitStartedAt)
+			var summary *string
+			if raw, ok := meta[metadataKeyWorkflowWaitFailedReason]; ok {
+				var s string
+				if err := json.Unmarshal(raw, &s); err == nil && s != "" {
+					summary = &s
+				}
+			}
+
+			// Compute phase from metadata timestamps + job state.
+			phase := "unknown"
+			switch {
+			case resolvedAt != nil:
+				phase = "resolved"
+			case row.State == rivertype.JobStatePending && startedAt != nil:
+				phase = "waiting"
+			case row.State == rivertype.JobStatePending:
+				phase = "not_started"
+			}
+
+			// Build terms, ensuring non-nil slice so JSON renders as [].
+			terms := make([]workflowTaskWaitTermOutput, 0, len(spec.Terms))
+			for _, t := range spec.Terms {
+				label := t.Label
+				if label == "" {
+					label = t.Name
+				}
+				term := workflowTaskWaitTermOutput{
+					Name:  t.Name,
+					Kind:  t.Kind,
+					Label: label,
+				}
+				if t.CELExpr != "" {
+					term.ExprCEL = &t.CELExpr
+				}
+				if t.Kind == "signal" && t.Key != "" {
+					term.SignalKey = &t.Key
+				}
+				if t.Kind == "timer" && t.Timer != nil && t.Timer.Name != "" {
+					term.TimerName = &t.Timer.Name
+				}
+				terms = append(terms, term)
+			}
+
+			waitOutput = &workflowTaskWaitOutput{
+				ExprCEL:    spec.Expr,
+				Phase:      phase,
+				Terms:      terms,
+				Inputs:     workflowTaskWaitInputsOutput{Deps: []struct{}{}, Signals: []struct{}{}, Timers: []struct{}{}},
+				ResolvedAt: resolvedAt,
+				StartedAt:  startedAt,
+				Summary:    summary,
+			}
+		}
+	}
+
+	// hasWait is true when the task carries a wait spec that hasn't resolved yet.
+	hasWait := waitOutput != nil && waitOutput.Phase != "resolved"
+
 	return &workflowTaskSerializable{
 		RiverJob:            riverJobToSerializableJob(row),
 		Deps:                deps,
-		IgnoreCancelledDeps: ignoreBool(metadataKeyWorkflowIgnoreCancelledDeps),
-		IgnoreDeletedDeps:   ignoreBool(metadataKeyWorkflowIgnoreDeletedDeps),
-		IgnoreDiscardedDeps: ignoreBool(metadataKeyWorkflowIgnoreDiscardedDeps),
+		IgnoreCancelledDeps: ignoreCancelled,
+		IgnoreDeletedDeps:   ignoreDeleted,
+		IgnoreDiscardedDeps: ignoreDiscarded,
 		Name:                name,
-		WaitReason:          computeWaitReason(row.State),
+		Wait:                waitOutput,
+		WaitReason:          computeWaitReason(row.State, hasWait, hasIncompleteDeps),
 		WorkflowID:          workflowID,
 	}, workflowName, nil
 }
@@ -627,7 +822,7 @@ func (req *workflowRerunRequest) ExtractRaw(r *http.Request) error {
 }
 
 type workflowRerunResponse struct {
-	WorkflowID  string              `json:"workflow_id"`
+	WorkflowID   string             `json:"workflow_id"`
 	InsertedJobs []*RiverJobMinimal `json:"inserted_jobs"`
 }
 

@@ -9,6 +9,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- Workflow detail: the OSS `GET /api/pro/workflows/{id}` endpoint now serializes a per-task `wait` object and an accurate `wait_reason` for tasks that carry `river:workflow_wait` metadata, lighting up the `CircuitSwitchHandle` gate visuals on the workflow diagram. Phase 1 emits the static wait spec (expr, terms with `signal_key`/`timer_name`, `started_at`, `resolved_at`) and derives phase from metadata timestamps. `wait_reason` now reflects actual dep-completion state (`dependencies`, `wait`, `dependencies_and_wait`, or `none`). [PR #TBD](https://github.com/riverqueue/riverui/pull/TBD).
 - New OSS workflow endpoints under `/api/pro/workflows/*` matching the frontend WorkflowDiagram contract:
   - `GET /api/pro/workflows` lists workflows aggregated by `river:workflow_id` metadata, with state-count summaries.
   - `GET /api/pro/workflows/{id}` returns the workflow's full task list (powers the DAG view).
