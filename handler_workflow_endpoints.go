@@ -18,6 +18,7 @@ import (
 	"github.com/riverqueue/river/riverdriver"
 	"github.com/riverqueue/river/rivershared/util/sliceutil"
 	"github.com/riverqueue/river/rivertype"
+	"github.com/riverqueue/river/riverworkflow"
 
 	"riverqueue.com/riverui/internal/apibundle"
 )
@@ -972,4 +973,283 @@ func newWorkflowULID() string {
 	out[24] = crockford[((raw[14]&3)<<3)|((raw[15]&224)>>5)]
 	out[25] = crockford[raw[15]&31]
 	return string(out)
+}
+
+//
+// workflowTaskSignalsEndpoint
+//
+
+type workflowTaskSignalsEndpoint[TTx any] struct {
+	apibundle.APIBundle[TTx]
+	apiendpoint.Endpoint[workflowTaskSignalsRequest, workflowTaskSignalsResponse]
+}
+
+func newWorkflowTaskSignalsEndpoint[TTx any](bundle apibundle.APIBundle[TTx]) *workflowTaskSignalsEndpoint[TTx] {
+	return &workflowTaskSignalsEndpoint[TTx]{APIBundle: bundle}
+}
+
+func (*workflowTaskSignalsEndpoint[TTx]) Meta() *apiendpoint.EndpointMeta {
+	return &apiendpoint.EndpointMeta{
+		Pattern:    "GET /api/pro/workflows/{id}/task-signals",
+		StatusCode: http.StatusOK,
+	}
+}
+
+type workflowTaskSignalsRequest struct {
+	ID       string  `json:"-" validate:"required"`
+	TaskName string  `json:"-" validate:"required"`
+	Key      *string `json:"-"`
+	Desc     bool    `json:"-"`
+	Limit    int     `json:"-"`
+	Scope    string  `json:"-"`
+	// CursorID, TermName, WorkflowAttempt are accepted from the query string
+	// but are unused in this implementation (driver lacks cursor-keyed paging).
+	CursorID        *int64 `json:"-"`
+	TermName        string `json:"-"`
+	WorkflowAttempt *int   `json:"-"`
+}
+
+func (req *workflowTaskSignalsRequest) ExtractRaw(r *http.Request) error {
+	req.ID = r.PathValue("id")
+	req.TaskName = r.URL.Query().Get("task_name")
+	if req.TaskName == "" {
+		return apierror.NewBadRequestf("task_name is required")
+	}
+
+	if v := r.URL.Query().Get("key"); v != "" {
+		req.Key = &v
+	}
+
+	// desc defaults to true (newest-first).
+	req.Desc = true
+	if v := r.URL.Query().Get("desc"); v == "false" {
+		req.Desc = false
+	}
+
+	req.Limit = 20
+	if v := r.URL.Query().Get("limit"); v != "" {
+		if n, err := strconv.Atoi(v); err == nil && n > 0 {
+			req.Limit = n
+		}
+	}
+
+	req.Scope = r.URL.Query().Get("scope")
+	if req.Scope == "" {
+		req.Scope = "history"
+	}
+
+	if v := r.URL.Query().Get("cursor_id"); v != "" {
+		if n, err := strconv.ParseInt(v, 10, 64); err == nil {
+			req.CursorID = &n
+		}
+	}
+
+	req.TermName = r.URL.Query().Get("term_name")
+
+	if v := r.URL.Query().Get("workflow_attempt"); v != "" {
+		if n, err := strconv.Atoi(v); err == nil {
+			req.WorkflowAttempt = &n
+		}
+	}
+
+	return nil
+}
+
+// workflowTaskSignalOutput mirrors WorkflowTaskSignalFromAPI in the frontend.
+type workflowTaskSignalOutput struct {
+	// attempt is always 0 — WorkflowSignal has no per-signal attempt counter.
+	Attempt   int             `json:"attempt"`
+	CreatedAt time.Time       `json:"created_at"`
+	ID        int64String     `json:"id"`
+	Key       string          `json:"key"`
+	Payload   json.RawMessage `json:"payload"`
+	Source    *string         `json:"source"`
+}
+
+type workflowTaskSignalsResponse struct {
+	HasMore      bool                        `json:"has_more"`
+	NextCursorID *int64String                `json:"next_cursor_id,omitempty"`
+	Scope        string                      `json:"scope"`
+	Signals      []*workflowTaskSignalOutput `json:"signals"`
+}
+
+func (a *workflowTaskSignalsEndpoint[TTx]) Execute(ctx context.Context, req *workflowTaskSignalsRequest) (*workflowTaskSignalsResponse, error) {
+	// Fetch limit+1 so we can detect whether more rows exist.
+	fetchMax := req.Limit + 1
+
+	rawSignals, err := a.DB.WorkflowSignalList(ctx, &riverdriver.WorkflowSignalListParams{
+		WorkflowID:      req.ID,
+		SignalKey:       req.Key,
+		Max:             fetchMax,
+		OrderByNewest:   req.Desc,
+		IncludeResolved: true,
+		Schema:          a.Client.Schema(),
+	})
+	if err != nil {
+		return nil, fmt.Errorf("error listing workflow signals: %w", err)
+	}
+
+	hasMore := len(rawSignals) > req.Limit
+	if hasMore {
+		rawSignals = rawSignals[:req.Limit]
+	}
+
+	signals := make([]*workflowTaskSignalOutput, 0, len(rawSignals))
+	for _, sig := range rawSignals {
+		payload := json.RawMessage(sig.Payload)
+		if len(payload) == 0 {
+			payload = json.RawMessage(`null`)
+		}
+		signals = append(signals, &workflowTaskSignalOutput{
+			Attempt:   0,
+			CreatedAt: sig.CreatedAt,
+			ID:        int64String(sig.ID),
+			Key:       sig.SignalKey,
+			Payload:   payload,
+			Source:    sig.Source,
+		})
+	}
+
+	resp := &workflowTaskSignalsResponse{
+		HasMore: hasMore,
+		Scope:   req.Scope,
+		Signals: signals,
+	}
+	if hasMore && len(rawSignals) > 0 {
+		id := int64String(rawSignals[len(rawSignals)-1].ID)
+		resp.NextCursorID = &id
+	}
+
+	return resp, nil
+}
+
+//
+// workflowTaskWaitDiagnosticsEndpoint
+//
+
+type workflowTaskWaitDiagnosticsEndpoint[TTx any] struct {
+	apibundle.APIBundle[TTx]
+	apiendpoint.Endpoint[workflowTaskWaitDiagnosticsRequest, workflowTaskWaitDiagnosticsResponse]
+}
+
+func newWorkflowTaskWaitDiagnosticsEndpoint[TTx any](bundle apibundle.APIBundle[TTx]) *workflowTaskWaitDiagnosticsEndpoint[TTx] {
+	return &workflowTaskWaitDiagnosticsEndpoint[TTx]{APIBundle: bundle}
+}
+
+func (*workflowTaskWaitDiagnosticsEndpoint[TTx]) Meta() *apiendpoint.EndpointMeta {
+	return &apiendpoint.EndpointMeta{
+		Pattern:    "GET /api/pro/workflows/{id}/task-wait-diagnostics",
+		StatusCode: http.StatusOK,
+	}
+}
+
+type workflowTaskWaitDiagnosticsRequest struct {
+	ID       string `json:"-" validate:"required"`
+	TaskName string `json:"-" validate:"required"`
+}
+
+func (req *workflowTaskWaitDiagnosticsRequest) ExtractRaw(r *http.Request) error {
+	req.ID = r.PathValue("id")
+	req.TaskName = r.URL.Query().Get("task_name")
+	if req.TaskName == "" {
+		return apierror.NewBadRequestf("task_name is required")
+	}
+	return nil
+}
+
+// workflowWaitTermDiagnosticOutput mirrors WorkflowWaitTermDiagnosticFromAPI
+// in the frontend. The library's WaitTermDiagnostic has Name/Kind/Label/Result
+// but no matched_count/required_count/last_matched_id. We map Result→satisfied
+// and use safe zero-value defaults for the count/ID fields.
+type workflowWaitTermDiagnosticOutput struct {
+	// NOTE: richer diagnostics inputs (matched_count, required_count, last_matched_id)
+	// require WaitDiagnostics to expose per-term match counts (follow-up).
+	LastMatchedID *int64String `json:"last_matched_id,omitempty"`
+	MatchedCount  int          `json:"matched_count"`
+	Name          string       `json:"name"`
+	RequiredCount int          `json:"required_count"`
+	Satisfied     bool         `json:"satisfied"`
+}
+
+// workflowWaitInputDiagnosticsOutput mirrors WorkflowWaitInputDiagnosticsFromAPI.
+// NOTE: richer diagnostics inputs require WaitDiagnostics to expose them (follow-up).
+type workflowWaitInputDiagnosticsOutput struct {
+	Deps    []struct{} `json:"deps"`
+	Signals []struct{} `json:"signals"`
+	Timers  []struct{} `json:"timers"`
+}
+
+type workflowTaskWaitDiagnosticsResponse struct {
+	EvalError       *string                            `json:"eval_error,omitempty"`
+	ExprResult      *bool                              `json:"expr_result,omitempty"`
+	Inputs          workflowWaitInputDiagnosticsOutput `json:"inputs"`
+	InspectedAt     time.Time                          `json:"inspected_at"`
+	Phase           string                             `json:"phase"`
+	SignalScanCount int                                `json:"signal_scan_count"`
+	SignalScanLimit int                                `json:"signal_scan_limit"`
+	Terms           []workflowWaitTermDiagnosticOutput `json:"terms"`
+	Truncated       bool                               `json:"truncated"`
+	WorkflowAttempt int                                `json:"workflow_attempt"`
+}
+
+const waitDiagDefaultScanLimit = 10000
+
+func (a *workflowTaskWaitDiagnosticsEndpoint[TTx]) Execute(ctx context.Context, req *workflowTaskWaitDiagnosticsRequest) (*workflowTaskWaitDiagnosticsResponse, error) {
+	opts := &riverworkflow.WorkflowWaitDiagnosticsOpts{
+		SignalScanLimit: waitDiagDefaultScanLimit,
+	}
+
+	diag, err := riverworkflow.WaitDiagnosticsForExec(ctx, a.DB, a.Client.Schema(), req.ID, req.TaskName, opts)
+	if err != nil {
+		return nil, fmt.Errorf("error computing wait diagnostics: %w", err)
+	}
+
+	phase := mapWaitPhase(diag.Phase)
+
+	terms := make([]workflowWaitTermDiagnosticOutput, 0, len(diag.Terms))
+	for _, t := range diag.Terms {
+		terms = append(terms, workflowWaitTermDiagnosticOutput{
+			// NOTE: richer per-term match counts require WaitDiagnostics to expose them (follow-up).
+			LastMatchedID: nil,
+			MatchedCount:  0,
+			Name:          t.Name,
+			RequiredCount: 0,
+			Satisfied:     t.Result,
+		})
+	}
+
+	exprResult := diag.ExprResult
+
+	return &workflowTaskWaitDiagnosticsResponse{
+		ExprResult: &exprResult,
+		// NOTE: richer diagnostics inputs require WaitDiagnostics to expose them (follow-up).
+		Inputs: workflowWaitInputDiagnosticsOutput{
+			Deps:    []struct{}{},
+			Signals: []struct{}{},
+			Timers:  []struct{}{},
+		},
+		InspectedAt:     time.Now().UTC(),
+		Phase:           phase,
+		SignalScanCount: 0, // NOTE: WaitDiagnostics does not expose signal scan count (follow-up).
+		SignalScanLimit: waitDiagDefaultScanLimit,
+		Terms:           terms,
+		Truncated:       diag.Truncated,
+		WorkflowAttempt: 0, // NOTE: WaitDiagnostics does not expose workflow attempt (follow-up).
+	}, nil
+}
+
+// mapWaitPhase maps a riverworkflow.WaitPhase to the frontend's
+// WorkflowTaskWaitPhase string. The library uses "pending"/"resolved"/"no_wait";
+// the frontend uses "waiting"/"resolved"/"not_started"/"unknown".
+func mapWaitPhase(p riverworkflow.WaitPhase) string {
+	switch p {
+	case riverworkflow.WaitPhasePending:
+		return "waiting"
+	case riverworkflow.WaitPhaseResolved:
+		return "resolved"
+	case riverworkflow.WaitPhaseNoWait:
+		return "not_started"
+	default:
+		return "unknown"
+	}
 }

@@ -16,6 +16,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   - `POST /api/pro/workflows/{id}/cancel` cancels every non-finalized task; running tasks stay running with `cancel_attempted_at` set.
   - `POST /api/pro/workflows/{id}/retry` resets cancelled/discarded tasks per mode (`failed_only`, `failed_and_downstream`, `all`).
 - The `workflow_queries` extension is now advertised by default in the OSS bundle so workflow routes light up automatically.
+- Phase 2 workflow wait-UI endpoints (Phase 2):
+  - `GET /api/pro/workflows/{id}/task-signals` lists emitted signals for a workflow task, with `key` filter, `desc` ordering, and `has_more`/`next_cursor_id` pagination fields. Note: server-side cursor filtering is a follow-up (the driver's `WorkflowSignalListParams` has no cursor field).
+  - `GET /api/pro/workflows/{id}/task-wait-diagnostics` evaluates the wait expression live via `riverworkflow.WaitDiagnosticsForExec`, returning `phase`, `expr_result`, `truncated`, and per-term `satisfied` state. Static `inputs` (deps/signals/timers) are returned as empty arrays — richer per-input details require follow-up library work.
 
 ## [v0.16.0] - 2026-05-19
 
