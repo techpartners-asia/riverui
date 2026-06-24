@@ -7,6 +7,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Fixed
+
+- Workflow `GET` now populates `wait.inputs` (signals/timers/deps) from the wait spec's terms and dependencies. Previously these were empty, which prevented the gate inspector from associating a signal term with its input — so the **Emit signal** (approve) button never rendered for signal-gated tasks. [PR #TBD](https://github.com/riverqueue/riverui/pull/TBD).
+
 ### Added
 
 - Workflow detail: the OSS `GET /api/pro/workflows/{id}` endpoint now serializes a per-task `wait` object and an accurate `wait_reason` for tasks that carry `river:workflow_wait` metadata, lighting up the `CircuitSwitchHandle` gate visuals on the workflow diagram. Phase 1 emits the static wait spec (expr, terms with `signal_key`/`timer_name`, `started_at`, `resolved_at`) and derives phase from metadata timestamps. `wait_reason` now reflects actual dep-completion state (`dependencies`, `wait`, `dependencies_and_wait`, or `none`). [PR #TBD](https://github.com/riverqueue/riverui/pull/TBD).

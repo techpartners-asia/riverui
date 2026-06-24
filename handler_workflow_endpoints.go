@@ -78,11 +78,27 @@ type workflowTaskWaitTermOutput struct {
 	TimerName *string `json:"timer_name,omitempty"`
 }
 
-// workflowTaskWaitInputsOutput holds the Phase 1 static inputs (always empty arrays).
+// workflowTaskWaitInputsOutput mirrors WorkflowTaskWaitInputsFromAPI. The
+// inputs are derived from the wait spec's terms + the task's deps so the
+// frontend can associate each term with its input (e.g. the gate inspector
+// maps a signal term to inputs.signals by key). Per-input live "result"
+// detail (match counts, fire times) is not populated here.
 type workflowTaskWaitInputsOutput struct {
-	Deps    []struct{} `json:"deps"`
-	Signals []struct{} `json:"signals"`
-	Timers  []struct{} `json:"timers"`
+	Deps    []workflowTaskWaitDepInputOutput    `json:"deps"`
+	Signals []workflowTaskWaitSignalInputOutput `json:"signals"`
+	Timers  []workflowTaskWaitTimerInputOutput  `json:"timers"`
+}
+
+type workflowTaskWaitDepInputOutput struct {
+	TaskName string `json:"task_name"`
+}
+
+type workflowTaskWaitSignalInputOutput struct {
+	Key string `json:"key"`
+}
+
+type workflowTaskWaitTimerInputOutput struct {
+	Name string `json:"name"`
 }
 
 // waitSpecJSON mirrors the JSON shape of a WaitSpec stored in river:workflow_wait.
@@ -766,11 +782,29 @@ func buildWorkflowTask(row *rivertype.JobRow, workflowID string, siblingStates m
 				terms = append(terms, term)
 			}
 
+			// Derive inputs from the terms + deps so the frontend can map each
+			// term to its input (the gate inspector matches a signal term to
+			// inputs.signals by key). Non-nil slices render as [] in JSON.
+			signalInputs := make([]workflowTaskWaitSignalInputOutput, 0, len(spec.Terms))
+			timerInputs := make([]workflowTaskWaitTimerInputOutput, 0, len(spec.Terms))
+			for _, t := range spec.Terms {
+				if t.Kind == "signal" && t.Key != "" {
+					signalInputs = append(signalInputs, workflowTaskWaitSignalInputOutput{Key: t.Key})
+				}
+				if t.Kind == "timer" && t.Timer != nil && t.Timer.Name != "" {
+					timerInputs = append(timerInputs, workflowTaskWaitTimerInputOutput{Name: t.Timer.Name})
+				}
+			}
+			depInputs := make([]workflowTaskWaitDepInputOutput, 0, len(deps))
+			for _, d := range deps {
+				depInputs = append(depInputs, workflowTaskWaitDepInputOutput{TaskName: d})
+			}
+
 			waitOutput = &workflowTaskWaitOutput{
 				ExprCEL:    spec.Expr,
 				Phase:      phase,
 				Terms:      terms,
-				Inputs:     workflowTaskWaitInputsOutput{Deps: []struct{}{}, Signals: []struct{}{}, Timers: []struct{}{}},
+				Inputs:     workflowTaskWaitInputsOutput{Deps: depInputs, Signals: signalInputs, Timers: timerInputs},
 				ResolvedAt: resolvedAt,
 				StartedAt:  startedAt,
 				Summary:    summary,

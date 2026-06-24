@@ -81,9 +81,12 @@ above) against the same database to drive the seeded workflows.
 
 ## Known limitations
 
-- **Diagnostics inputs** (the deps/signals/timers *input breakdown* panel) are
-  currently empty — the library's `WaitDiagnostics` does not yet return its
-  internal inputs. Phase, `expr_result`, and per-term results are populated.
+- **Diagnostics-endpoint inputs** (the live input breakdown from
+  `task-wait-diagnostics`) are currently empty — the library's
+  `WaitDiagnostics` does not yet return its internal inputs. Phase,
+  `expr_result`, and per-term results are populated. (The workflow `GET`
+  response *does* populate `wait.inputs` from the spec's terms + deps, which
+  is what the gate inspector and the Emit-signal button rely on.)
 - **Signal pagination** — the signals endpoint returns the newest page with a
   `has_more` flag, but `cursor_id` is not yet consumed server-side, so "next
   page" re-returns the first page. Fine for typical (small) signal lists.
