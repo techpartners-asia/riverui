@@ -7,6 +7,16 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Added
+
+- Workflow detail: the OSS `GET /api/pro/workflows/{id}` endpoint now serializes a per-task `wait` object and an accurate `wait_reason` for tasks that carry `river:workflow_wait` metadata, lighting up the `CircuitSwitchHandle` gate visuals on the workflow diagram. Phase 1 emits the static wait spec (expr, terms with `signal_key`/`timer_name`, `started_at`, `resolved_at`) and derives phase from metadata timestamps. `wait_reason` now reflects actual dep-completion state (`dependencies`, `wait`, `dependencies_and_wait`, or `none`). [PR #TBD](https://github.com/riverqueue/riverui/pull/TBD).
+- New OSS workflow endpoints under `/api/pro/workflows/*` matching the frontend WorkflowDiagram contract:
+  - `GET /api/pro/workflows` lists workflows aggregated by `river:workflow_id` metadata, with state-count summaries.
+  - `GET /api/pro/workflows/{id}` returns the workflow's full task list (powers the DAG view).
+  - `POST /api/pro/workflows/{id}/cancel` cancels every non-finalized task; running tasks stay running with `cancel_attempted_at` set.
+  - `POST /api/pro/workflows/{id}/retry` resets cancelled/discarded tasks per mode (`failed_only`, `failed_and_downstream`, `all`).
+- The `workflow_queries` extension is now advertised by default in the OSS bundle so workflow routes light up automatically.
+
 ## [v0.16.0] - 2026-05-19
 
 Version 0.16.0 includes support for the all new workflow engine in River Pro v0.24.0, including signals, timers, and greater introspection capabilities.

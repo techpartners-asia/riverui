@@ -83,13 +83,39 @@ type AttemptErrorFromAPI = {
   trace: string;
 };
 
+// KnownMetadata describes the shape the UI consumes from a job's metadata.
+// River OSS writes workflow keys under the canonical `river:` namespace
+// (`river:workflow_id` etc.); legacy riverproui payloads wrote them at the
+// top level without a prefix. All workflow keys are optional here so consumers
+// MUST go through the accessors below (extractWorkflowID etc.), which try the
+// canonical key first and fall back to the legacy unprefixed key.
 type KnownMetadata = {
-  deps: string[];
+  deps?: string[];
   "river:log"?: RiverJobLogEntry[];
-  task: string;
-  workflow_id: string;
+  "river:workflow_deps"?: string[];
+  "river:workflow_id"?: string;
+  "river:workflow_name"?: string;
+  "river:workflow_task"?: string;
+  task?: string;
+  workflow_id?: string;
   workflow_name?: string;
-  workflow_staged_at: string;
+  workflow_staged_at?: string;
+};
+
+// extractWorkflowID returns the workflow ID from a job's metadata. It prefers
+// the canonical River OSS key (`river:workflow_id`) and falls back to the
+// legacy unprefixed key (`workflow_id`) for older riverproui payloads.
+// Returns undefined when the job is not a workflow task.
+export const extractWorkflowID = (
+  metadata: object | undefined,
+): string | undefined => {
+  if (!metadata || typeof metadata !== "object") return undefined;
+  const m = metadata as Record<string, unknown>;
+  const prefixed = m["river:workflow_id"];
+  if (typeof prefixed === "string" && prefixed !== "") return prefixed;
+  const legacy = m["workflow_id"];
+  if (typeof legacy === "string" && legacy !== "") return legacy;
+  return undefined;
 };
 
 type RiverJobLogEntry = {

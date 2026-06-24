@@ -1,10 +1,12 @@
 import WorkflowDetail from "@components/WorkflowDetail";
 import { useRefreshSetting } from "@contexts/RefreshSettings.hook";
-import { toastSuccess } from "@services/toast";
+import { extractWorkflowID } from "@services/jobs";
+import { toastError, toastSuccess } from "@services/toast";
 import {
   cancelJobs,
   getWorkflow,
   getWorkflowKey,
+  rerunWorkflow,
   retryWorkflow,
   type WorkflowRetryMode,
 } from "@services/workflows";
@@ -80,7 +82,17 @@ function WorkflowComponent() {
     });
   };
 
-  const workflowID = workflow?.tasks?.[0]?.metadata.workflow_id;
+  const workflowID = extractWorkflowID(workflow?.tasks?.[0]?.metadata);
+
+  // Guard against missing workflow ID with a loud failure so a bad metadata
+  // contract surfaces immediately instead of silently swallowing the click.
+  const requireWorkflowID = (action: string): string | undefined => {
+    if (workflowID) return workflowID;
+    const msg = `Cannot ${action}: workflow ID missing from task metadata`;
+    console.error(msg, { metadata: workflow?.tasks?.[0]?.metadata });
+    toastError({ message: msg, duration: 4000 });
+    return undefined;
+  };
   const cancelMutation = useMutation({
     mutationFn: cancelJobs,
     onSuccess: () => {
@@ -109,21 +121,41 @@ function WorkflowComponent() {
     },
   });
 
+  const rerunMutation = useMutation({
+    mutationFn: rerunWorkflow,
+    onSuccess: (result) => {
+      queryClient.invalidateQueries({ queryKey: ["listWorkflows"] });
+      toastSuccess({
+        message: `New workflow ${result.workflowID} created`,
+        duration: 3000,
+      });
+      navigate({
+        to: "/workflows/$workflowId",
+        params: { workflowId: result.workflowID },
+      });
+    },
+  });
+
   return (
     <WorkflowDetail
       cancelPending={cancelMutation.isPending}
       loading={workflowQuery.isLoading}
-      onCancel={() =>
-        workflowID && cancelMutation.mutate({ workflowID: String(workflowID) })
-      }
-      onRetry={(mode: WorkflowRetryMode, resetHistory: boolean) =>
-        workflowID &&
-        retryMutation.mutate({
-          workflowID: String(workflowID),
-          mode,
-          resetHistory,
-        })
-      }
+      onCancel={() => {
+        const id = requireWorkflowID("cancel workflow");
+        if (!id) return;
+        cancelMutation.mutate({ workflowID: id });
+      }}
+      onRerun={() => {
+        const id = requireWorkflowID("rerun workflow");
+        if (!id) return;
+        rerunMutation.mutate({ workflowID: id });
+      }}
+      onRetry={(mode: WorkflowRetryMode, resetHistory: boolean) => {
+        const id = requireWorkflowID("retry workflow");
+        if (!id) return;
+        retryMutation.mutate({ workflowID: id, mode, resetHistory });
+      }}
+      rerunPending={rerunMutation.isPending}
       retryPending={retryMutation.isPending}
       selectedJobId={selectedJobId}
       setSelectedJobId={setSelectedJobId}

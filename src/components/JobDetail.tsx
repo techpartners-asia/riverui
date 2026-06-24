@@ -12,7 +12,7 @@ import {
   XCircleIcon,
 } from "@heroicons/react/24/outline";
 import useFeature from "@hooks/use-feature";
-import { Job, JobWithKnownMetadata } from "@services/jobs";
+import { extractWorkflowID, Job, JobWithKnownMetadata } from "@services/jobs";
 import { JobState } from "@services/types";
 import { Link } from "@tanstack/react-router";
 import { capitalize } from "@utils/string";
@@ -130,28 +130,26 @@ export default function JobDetail({
               </div>
               {featureEnabledWorkflows &&
                 jobWithMetadata &&
-                jobWithMetadata.metadata.workflow_id && (
-                  <div className="col-span-6 border-t border-slate-100 p-4 sm:px-0 dark:border-slate-800">
-                    <dt className="text-sm leading-6 font-medium text-slate-900 dark:text-slate-100">
-                      Workflow
-                    </dt>
-                    <dd className="mt-1 overflow-hidden font-mono text-sm leading-6 text-ellipsis text-slate-700 sm:mt-2 dark:text-slate-300">
-                      {jobWithMetadata.metadata.workflow_id ? (
+                (() => {
+                  const wfID = extractWorkflowID(jobWithMetadata.metadata);
+                  if (!wfID) return null;
+                  return (
+                    <div className="col-span-6 border-t border-slate-100 p-4 sm:px-0 dark:border-slate-800">
+                      <dt className="text-sm leading-6 font-medium text-slate-900 dark:text-slate-100">
+                        Workflow
+                      </dt>
+                      <dd className="mt-1 overflow-hidden font-mono text-sm leading-6 text-ellipsis text-slate-700 sm:mt-2 dark:text-slate-300">
                         <Link
-                          params={{
-                            workflowId: jobWithMetadata.metadata.workflow_id,
-                          }}
+                          params={{ workflowId: wfID }}
                           search={{ selected: job.id }}
                           to="/workflows/$workflowId"
                         >
-                          {jobWithMetadata.metadata.workflow_id}
+                          {wfID}
                         </Link>
-                      ) : (
-                        "–"
-                      )}
-                    </dd>
-                  </div>
-                )}
+                      </dd>
+                    </div>
+                  );
+                })()}
             </dl>
           </div>
 
